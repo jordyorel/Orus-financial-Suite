@@ -77,6 +77,11 @@ pub fn toInternal(
     errdefer entries.deinit(alloc);
     for (2..129) |n| {
         const val = iso.get(@intCast(n)) orelse continue;
+        if (n == 2) {
+            // Field 2 (PAN) — hash into pan_hash, never store raw (CDC §6, PCI-DSS Req 3.4).
+            msg.pan_hash = orusshare.hash.hashPan(val);
+            continue;
+        }
         const duped = try alloc.dupe(u8, val);
         entries.append(alloc, .{ .id = @intCast(n), .value = duped }) catch
             return error.OutOfMemory;

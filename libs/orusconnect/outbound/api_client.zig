@@ -28,13 +28,43 @@ pub const ApiError = error{
 
 // Stateless HTTP/1.1 client — connect-per-request, V1.
 // Supports Content-Length responses only (no chunked transfer encoding).
+//
+// TLS modes:
+//   init()    → plain TCP (for tests, internal services)
+//   initTls() → HTTPS with system CA bundle (for MoMo public APIs)
 pub const ApiClient = struct {
     host: []const u8,
     port: u16,
-    io: std.Io,
+    io:   std.Io,
+    // Non-null when TLS is enabled. Holds a loaded CA bundle + associated lock.
+    tls_state: ?TlsState,
+
+    const TlsState = struct {
+        bundle: std.crypto.Certificate.Bundle,
+        lock:   std.Io.RwLock,
+        gpa:    std.mem.Allocator,
+    };
 
     pub fn init(host: []const u8, port: u16, io: std.Io) ApiClient {
-        return .{ .host = host, .port = port, .io = io };
+        return .{ .host = host, .port = port, .io = io, .tls_state = null };
+    }
+
+    // Load the system CA bundle once and store it in the client.
+    // Use for outbound HTTPS to public MoMo APIs (MTN, Airtel, Wave…).
+    // Caller must call deinit() when done.
+    pub fn initTls(host: []const u8, port: u16, io: std.Io, gpa: std.mem.Allocator) !ApiClient {
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        try bundle.rescan(gpa, io, std.Io.Clock.real.now(io));
+        return .{
+            .host = host,
+            .port = port,
+            .io   = io,
+            .tls_state = .{ .bundle = bundle, .lock = std.Io.RwLock.init, .gpa = gpa },
+        };
+    }
+
+    pub fn deinit(self: *ApiClient) void {
+        if (self.tls_state) |*s| s.bundle.deinit(s.gpa);
     }
 
     pub fn post(
@@ -50,40 +80,82 @@ pub const ApiClient = struct {
             return error.ConnectionFailed;
         defer stream.close(self.io);
 
-        var write_buf: [8192]u8 = undefined;
-        var sw = stream.writer(self.io, &write_buf);
-        var w = &sw.interface;
+        var raw_read: [8192]u8 = undefined;
+        var raw_write: [8192]u8 = undefined;
+        var sr = stream.reader(self.io, &raw_read);
+        var sw = stream.writer(self.io, &raw_write);
 
-        // Request line
-        w.writeAll("POST ") catch return error.ConnectionFailed;
-        w.writeAll(path) catch return error.ConnectionFailed;
-        w.writeAll(" HTTP/1.1\r\nHost: ") catch return error.ConnectionFailed;
-        w.writeAll(self.host) catch return error.ConnectionFailed;
-        w.writeAll("\r\n") catch return error.ConnectionFailed;
-
-        // Caller-provided headers
-        for (headers) |h| {
-            w.writeAll(h.name) catch return error.ConnectionFailed;
-            w.writeAll(": ") catch return error.ConnectionFailed;
-            w.writeAll(h.value) catch return error.ConnectionFailed;
-            w.writeAll("\r\n") catch return error.ConnectionFailed;
+        if (self.tls_state) |*s| {
+            var tls_read: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+            var tls_write: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+            var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+            std.c.arc4random_buf(&entropy, entropy.len);
+            var tls = std.crypto.tls.Client.init(&sr.interface, &sw.interface, .{
+                .host = .{ .explicit = self.host },
+                .ca   = .{ .bundle = .{
+                    .gpa    = s.gpa,
+                    .io     = self.io,
+                    .lock   = &s.lock,
+                    .bundle = &s.bundle,
+                }},
+                .write_buffer = &tls_write,
+                .read_buffer  = &tls_read,
+                .entropy      = &entropy,
+                .realtime_now = std.Io.Clock.real.now(self.io),
+            }) catch return error.ConnectionFailed;
+            defer tls.end() catch {};
+            return doHttp(&tls.reader, &tls.writer, self.host, path, headers, body, alloc);
+        } else {
+            return doHttp(&sr.interface, &sw.interface, self.host, path, headers, body, alloc);
         }
-
-        // Mandatory headers
-        var cl_buf: [20]u8 = undefined;
-        const cl_str = std.fmt.bufPrint(&cl_buf, "{d}", .{body.len}) catch unreachable;
-        w.writeAll("Content-Length: ") catch return error.ConnectionFailed;
-        w.writeAll(cl_str) catch return error.ConnectionFailed;
-        w.writeAll("\r\nConnection: close\r\n\r\n") catch return error.ConnectionFailed;
-        if (body.len > 0) w.writeAll(body) catch return error.ConnectionFailed;
-        sw.interface.flush() catch return error.ConnectionFailed;
-
-        // Read response
-        var read_buf: [8192]u8 = undefined;
-        var sr = stream.reader(self.io, &read_buf);
-        return parseResponse(&sr.interface, alloc);
     }
 };
+
+fn doHttp(
+    r: *std.Io.Reader,
+    w: *std.Io.Writer,
+    host: []const u8,
+    path: []const u8,
+    headers: []const Header,
+    body: []const u8,
+    alloc: std.mem.Allocator,
+) ApiError!Response {
+    // Request line
+    w.writeAll("POST ") catch return error.ConnectionFailed;
+    w.writeAll(path) catch return error.ConnectionFailed;
+    w.writeAll(" HTTP/1.1\r\nHost: ") catch return error.ConnectionFailed;
+    w.writeAll(host) catch return error.ConnectionFailed;
+    w.writeAll("\r\n") catch return error.ConnectionFailed;
+
+    for (headers) |h| {
+        w.writeAll(h.name) catch return error.ConnectionFailed;
+        w.writeAll(": ") catch return error.ConnectionFailed;
+        w.writeAll(h.value) catch return error.ConnectionFailed;
+        w.writeAll("\r\n") catch return error.ConnectionFailed;
+    }
+
+    // Content-Length — digit-by-digit, no format buffer.
+    w.writeAll("Content-Length: ") catch return error.ConnectionFailed;
+    var cl_buf: [20]u8 = undefined;
+    var cl_pos: usize = 20;
+    var cl_rem = body.len;
+    if (cl_rem == 0) {
+        cl_pos -= 1;
+        cl_buf[cl_pos] = '0';
+    } else {
+        while (cl_rem > 0) {
+            cl_pos -= 1;
+            cl_buf[cl_pos] = '0' + @as(u8, @intCast(cl_rem % 10));
+            cl_rem /= 10;
+        }
+    }
+    w.writeAll(cl_buf[cl_pos..]) catch return error.ConnectionFailed;
+    w.writeAll("\r\nConnection: close\r\n\r\n") catch return error.ConnectionFailed;
+    if (body.len > 0) w.writeAll(body) catch return error.ConnectionFailed;
+    w.flush() catch return error.ConnectionFailed;
+
+    return parseResponse(r, alloc);
+}
 
 fn parseResponse(r: *std.Io.Reader, alloc: std.mem.Allocator) ApiError!Response {
     // Read headers section (ends at \r\n\r\n)

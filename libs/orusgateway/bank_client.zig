@@ -7,12 +7,20 @@ pub const IsoMessage = parser.IsoMessage;
 // Message Length Indicator (MLI). Some acquiring hosts use 4 bytes.
 pub const LengthPrefix = enum { two_byte_be, four_byte_be };
 
+pub const TlsMode = enum {
+    none,
+    // TLS with self-signed certificate verification — for private bank networks
+    // (GIMAC, BEAC) that issue their own CA. Does not accept public CA chains.
+    self_signed,
+};
+
 pub const Config = struct {
     host: []const u8,
     port: u16,
     length_prefix: LengthPrefix = .two_byte_be,
     // Hard ceiling on inbound message size (prevents memory exhaustion).
     max_response_bytes: usize = 8192,
+    tls: TlsMode = .none,
 };
 
 pub const BankClientError = error{
@@ -43,31 +51,51 @@ pub const BankClient = struct {
         var stream = addr.connect(self.io, .{ .mode = .stream }) catch return error.BankUnreachable;
         defer stream.close(self.io);
 
-        // ── Send ─────────────────────────────────────────────────────────────
+        var read_buf: [8192]u8 = undefined;
+        var write_buf: [8192]u8 = undefined;
+        var sr = stream.reader(self.io, &read_buf);
+        var sw = stream.writer(self.io, &write_buf);
 
+        switch (self.config.tls) {
+            .none => return self.doExchange(&sr.interface, &sw.interface, msg, alloc),
+            .self_signed => {
+                var tls_read: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+                var tls_write: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
+                var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+                std.c.arc4random_buf(&entropy, entropy.len);
+                var tls = std.crypto.tls.Client.init(&sr.interface, &sw.interface, .{
+                    .host     = .{ .explicit = self.config.host },
+                    .ca       = .self_signed,
+                    .write_buffer  = &tls_write,
+                    .read_buffer   = &tls_read,
+                    .entropy       = &entropy,
+                    .realtime_now  = std.Io.Clock.real.now(self.io),
+                }) catch return error.BankUnreachable;
+                defer tls.end() catch {};
+                return self.doExchange(&tls.reader, &tls.writer, msg, alloc);
+            },
+        }
+    }
+
+    fn doExchange(
+        self: *const BankClient,
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        msg: *const IsoMessage,
+        alloc: std.mem.Allocator,
+    ) BankClientError!IsoMessage {
         const payload = parser.serialize(msg, alloc) catch return error.BankUnreachable;
         defer alloc.free(payload);
-
-        var write_buf: [8192]u8 = undefined;
-        var sw = stream.writer(self.io, &write_buf);
-        var w = &sw.interface;
 
         writeLengthPrefix(w, payload.len, self.config.length_prefix) catch
             return error.BankUnreachable;
         w.writeAll(payload) catch return error.BankUnreachable;
         w.flush() catch return error.BankUnreachable;
 
-        // ── Receive ──────────────────────────────────────────────────────────
-
-        var read_buf: [8192]u8 = undefined;
-        var sr = stream.reader(self.io, &read_buf);
-        var r = &sr.interface;
-
         const resp_len = readLengthPrefix(r, self.config.length_prefix) catch
             return error.MalformedResponse;
-
         if (resp_len > self.config.max_response_bytes) return error.ResponseTooLarge;
-        if (resp_len < 4) return error.MalformedResponse; // minimum: 4-byte MTI
+        if (resp_len < 4) return error.MalformedResponse;
 
         const resp_buf = alloc.alloc(u8, resp_len) catch return error.BankUnreachable;
         defer alloc.free(resp_buf);

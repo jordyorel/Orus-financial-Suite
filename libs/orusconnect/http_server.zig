@@ -8,6 +8,14 @@ pub const Config = struct {
     write_buffer_size: usize = 8192,
     header_max_bytes: usize = 8192,
     body_max_bytes: usize = 1024 * 1024, // 1 MB
+
+    // TLS server-side termination.
+    // Zig 0.16 stdlib provides only a TLS client (std.crypto.tls.Client).
+    // For inbound TLS, run OrusConnect behind a TLS-terminating reverse proxy
+    // (nginx, caddy, envoy) and set these fields for documentation/validation.
+    // When set, serve() logs a startup reminder about the proxy requirement.
+    tls_cert_path: ?[]const u8 = null,
+    tls_key_path:  ?[]const u8 = null,
 };
 
 pub const Method = enum { GET, POST, PUT, DELETE, PATCH, OPTIONS };
@@ -209,20 +217,33 @@ fn parseMethod(s: []const u8) ?Method {
 // ── HTTP/1.1 response writer ──────────────────────────────────────────────────
 
 pub fn writeResponse(w: *std.Io.Writer, resp: HttpResponse) std.Io.Writer.Error!void {
-    var line_buf: [128]u8 = undefined;
-
-    const status_line = std.fmt.bufPrint(&line_buf, "HTTP/1.1 {d} {s}\r\n", .{
-        resp.status, resp.status_text,
-    }) catch unreachable;
-    try w.writeAll(status_line);
-
-    const ct_line = std.fmt.bufPrint(&line_buf, "Content-Type: {s}\r\n", .{resp.content_type}) catch unreachable;
-    try w.writeAll(ct_line);
-
-    const cl_line = std.fmt.bufPrint(&line_buf, "Content-Length: {d}\r\n", .{resp.body.len}) catch unreachable;
-    try w.writeAll(cl_line);
-
-    try w.writeAll("Connection: close\r\n\r\n");
+    // Status line: write the 3-digit code digit-by-digit — HTTP codes are always 100-599.
+    const s = resp.status;
+    try w.writeAll("HTTP/1.1 ");
+    try w.writeByte('0' + @as(u8, @intCast(s / 100)));
+    try w.writeByte('0' + @as(u8, @intCast((s / 10) % 10)));
+    try w.writeByte('0' + @as(u8, @intCast(s % 10)));
+    try w.writeByte(' ');
+    try w.writeAll(resp.status_text);
+    try w.writeAll("\r\nContent-Type: ");
+    try w.writeAll(resp.content_type);
+    try w.writeAll("\r\nContent-Length: ");
+    // body.len ≤ body_max_bytes (1 MB = 7 digits) — [8]u8 always sufficient.
+    var len_buf: [8]u8 = undefined;
+    var len_pos: usize = 8;
+    var remaining = resp.body.len;
+    if (remaining == 0) {
+        len_pos -= 1;
+        len_buf[len_pos] = '0';
+    } else {
+        while (remaining > 0) {
+            len_pos -= 1;
+            len_buf[len_pos] = '0' + @as(u8, @intCast(remaining % 10));
+            remaining /= 10;
+        }
+    }
+    try w.writeAll(len_buf[len_pos..]);
+    try w.writeAll("\r\nConnection: close\r\n\r\n");
     try w.writeAll(resp.body);
 }
 
@@ -301,6 +322,16 @@ pub const Server = struct {
 
         var tcp = try ThreadListener.init(self.config.host, self.config.port, io);
         defer tcp.deinit();
+
+        if (self.config.tls_cert_path != null or self.config.tls_key_path != null) {
+            std.log.info(
+                "OrusConnect TLS: configure your reverse proxy (nginx/caddy/envoy) " ++
+                "to terminate TLS and forward plain HTTP to {s}:{d}. " ++
+                "cert={?s} key={?s}",
+                .{ self.config.host, self.config.port,
+                   self.config.tls_cert_path, self.config.tls_key_path },
+            );
+        }
 
         self.running.store(true, .seq_cst);
 

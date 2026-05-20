@@ -54,6 +54,7 @@ pub const PendingTxStore = struct {
         const bytes = try self.alloc.dupe(u8, entry.msg_bytes);
         errdefer self.alloc.free(bytes);
         var stored = entry;
+        stored.reference_id = key; // stored value shares the map key allocation — no dangling ptr
         stored.msg_bytes = bytes;
         try self.map.put(key, stored);
     }

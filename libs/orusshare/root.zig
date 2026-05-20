@@ -9,6 +9,8 @@ pub const InternalMessage = message.InternalMessage;
 pub const MessageOrigin = message.MessageOrigin;
 pub const ServiceProvider = message.ServiceProvider;
 pub const Metrics = metrics.Metrics;
+pub const maskPan = hash.maskPan;
+pub const hashPan = hash.hashPan;
 
 test {
     _ = @import("message.zig");

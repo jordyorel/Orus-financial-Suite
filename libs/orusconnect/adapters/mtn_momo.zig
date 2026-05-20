@@ -274,9 +274,14 @@ fn randomStan() [6]u8 {
     var raw: [3]u8 = undefined;
     std.c.arc4random_buf(&raw, raw.len);
     const n = (@as(u32, raw[0]) << 16 | @as(u32, raw[1]) << 8 | raw[2]) % 1_000_000;
-    var stan: [6]u8 = undefined;
-    _ = std.fmt.bufPrint(&stan, "{d:0>6}", .{n}) catch unreachable;
-    return stan;
+    return .{
+        '0' + @as(u8, @intCast(n / 100_000)),
+        '0' + @as(u8, @intCast((n / 10_000) % 10)),
+        '0' + @as(u8, @intCast((n / 1_000) % 10)),
+        '0' + @as(u8, @intCast((n / 100) % 10)),
+        '0' + @as(u8, @intCast((n / 10) % 10)),
+        '0' + @as(u8, @intCast(n % 10)),
+    };
 }
 
 fn strField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
