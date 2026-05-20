@@ -1,0 +1,29 @@
+[meta]
+id          = "mtn_momo"
+version     = "1.0"
+auth_type   = "oauth2"
+mti_debit   = "0200"
+mti_credit  = "0200"
+
+[endpoints]
+transfer    = "POST /collection/v1_0/requesttopay"
+callback    = "POST /webhooks/mtn"
+status      = "GET /collection/v1_0/requesttopay/{referenceId}"
+
+[[field_mappings]]
+json_path   = "msisdn"
+im_field    = "pan"
+transform   = "msisdn_to_pan"
+
+[[field_mappings]]
+json_path   = "amount"
+im_field    = "amount"
+transform   = "to_centimes"
+
+[[field_mappings]]
+json_path   = "currency"
+im_field    = "currency"
+
+[[field_mappings]]
+json_path   = "externalId"
+im_field    = "external_id"

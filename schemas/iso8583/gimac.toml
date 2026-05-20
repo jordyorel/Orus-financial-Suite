@@ -1,0 +1,161 @@
+# GIMAC — Switch interbancaire Afrique Centrale (zone CEMAC)
+# Dialect: 2-byte length header, ASCII MTI, BCD amounts/PAN, ASCII most fields.
+
+[meta]
+id      = "gimac"
+version = "2.1"
+
+[transport]
+header_type = "length_2"
+
+[encoding]
+default = "ASCII"
+mti     = "ASCII"
+
+[[fields]]
+id       = 2
+name     = "PAN"
+type     = "LLVAR"
+encoding = "BCD"
+length   = 19
+
+[[fields]]
+id       = 3
+name     = "ProcessingCode"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 6
+
+[[fields]]
+id       = 4
+name     = "Amount"
+type     = "FIXED"
+encoding = "BCD"
+length   = 12
+
+[[fields]]
+id       = 5
+name     = "SettlementAmount"
+type     = "FIXED"
+encoding = "BCD"
+length   = 12
+
+[[fields]]
+id       = 7
+name     = "TransmissionDateTime"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 10
+
+[[fields]]
+id       = 11
+name     = "STAN"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 6
+
+[[fields]]
+id       = 12
+name     = "LocalTransactionTime"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 6
+
+[[fields]]
+id       = 13
+name     = "LocalTransactionDate"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 4
+
+[[fields]]
+id       = 14
+name     = "ExpirationDate"
+type     = "FIXED"
+encoding = "BCD"
+length   = 4
+
+[[fields]]
+id       = 22
+name     = "POSEntryMode"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 3
+
+[[fields]]
+id       = 32
+name     = "AcquiringInstitutionID"
+type     = "LLVAR"
+encoding = "ASCII"
+length   = 11
+
+[[fields]]
+id       = 37
+name     = "RetrievalReferenceNumber"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 12
+
+[[fields]]
+id       = 38
+name     = "AuthorizationCode"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 6
+
+[[fields]]
+id       = 39
+name     = "ResponseCode"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 2
+
+[[fields]]
+id       = 41
+name     = "TerminalID"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 8
+
+[[fields]]
+id       = 42
+name     = "MerchantID"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 15
+
+[[fields]]
+id       = 43
+name     = "MerchantNameLocation"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 40
+
+[[fields]]
+id       = 49
+name     = "CurrencyCode"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 3
+
+[[fields]]
+id        = 55
+name      = "EMVData"
+type      = "LLLVAR"
+encoding  = "BINARY"
+length    = 999
+subschema = "emv_tlv"
+
+[[fields]]
+id       = 102
+name     = "AccountID1"
+type     = "LLVAR"
+encoding = "ASCII"
+length   = 28
+
+[[fields]]
+id       = 103
+name     = "AccountID2"
+type     = "LLVAR"
+encoding = "ASCII"
+length   = 28

@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(python3 *)",
+      "Bash(zig version *)",
+      "Bash(zig init *)",
+      "WebFetch(domain:ziglang.org)",
+      "Bash(zig env *)",
+      "Bash(zig build *)",
+      "Bash(zig test *)",
+      "Bash(zig help *)",
+      "Bash(sed -n '240,310p' /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/Io/net.zig)",
+      "Bash(sed -n '1402,1450p' /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/Io/net.zig)",
+      "Bash(sed -n '1607,1630p' /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/Io/Threaded.zig)",
+      "Bash(sed -n '1806,1820p' /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/Io/Threaded.zig)",
+      "Bash(sed -n '1243,1260p' /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/Io/net.zig)",
+      "Bash(sed -n '1393,1420p' /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/Io/net.zig)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(sed -n '332,345p' /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/Io/net.zig)",
+      "Bash(sed -n '1280,1395p' /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/Io/net.zig)",
+      "Bash(echo \"tests: $?\")",
+      "Bash(echo \"build: $?\")",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(textutil -convert txt CDC_OrusInfraSuite.docx -stdout)",
+      "Bash(pandoc CDC_OrusInfraSuite.docx -t plain)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(sed -n '182,230p' /Users/hierat/Desktop/orus-suite/libs/orusconnect/adapters/mtn_momo.zig)",
+      "Bash(sed -n '175,225p' /Users/hierat/Desktop/orus-suite/libs/orusconnect/adapters/airtel_money.zig)",
+      "Bash(grep -v \"^$\")",
+      "Bash(echo \"unit: $?\")",
+      "Bash(echo \"integration: $?\")",
+      "Bash(echo \"battle: $?\")",
+      "Bash(./.zig-cache/o/cc5cb0d3abcdf52860dd80360bbc5308/test --summary all)",
+      "Bash(./.zig-cache/o/cc5cb0d3abcdf52860dd80360bbc5308/test)",
+      "Bash(echo \"battle exit: $?\")",
+      "Bash(./.zig-cache/o/fe7337ff4aab0aa0cf0aad635d12077a/test)",
+      "Bash(echo \"broker exit: $?\")"
+    ]
+  }
+}

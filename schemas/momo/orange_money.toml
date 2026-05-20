@@ -1,0 +1,29 @@
+[meta]
+id          = "orange_money"
+version     = "2.1"
+auth_type   = "oauth2_hmac"
+mti_debit   = "0200"
+mti_credit  = "0200"
+
+[endpoints]
+transfer    = "POST /v2/payment"
+callback    = "POST /webhooks/orange"
+status      = "GET /v2/payment/{id}"
+
+[[field_mappings]]
+json_path   = "msisdn"
+im_field    = "pan"
+transform   = "msisdn_to_pan"
+
+[[field_mappings]]
+json_path   = "amount.value"
+im_field    = "amount"
+transform   = "to_centimes"
+
+[[field_mappings]]
+json_path   = "amount.currency"
+im_field    = "currency"
+
+[[field_mappings]]
+json_path   = "externalId"
+im_field    = "external_id"

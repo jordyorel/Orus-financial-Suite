@@ -1,0 +1,8 @@
+.{
+    .name = .orusinfra,
+    .fingerprint = 0x9c7d24f115caec7f,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .paths = .{"."},
+    .dependencies = .{},
+}

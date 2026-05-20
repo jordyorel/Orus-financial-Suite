@@ -1,0 +1,29 @@
+[meta]
+id          = "airtel_money"
+version     = "1.0"
+auth_type   = "oauth2"
+mti_debit   = "0200"
+mti_credit  = "0200"
+
+[endpoints]
+transfer    = "POST /v1/airtel/payment"
+callback    = "POST /webhooks/airtel"
+status      = "GET /v1/airtel/payment/{transactionId}"
+
+[[field_mappings]]
+json_path   = "msisdn"
+im_field    = "pan"
+transform   = "msisdn_to_pan"
+
+[[field_mappings]]
+json_path   = "amount"
+im_field    = "amount"
+transform   = "to_centimes"
+
+[[field_mappings]]
+json_path   = "currency"
+im_field    = "currency"
+
+[[field_mappings]]
+json_path   = "reference"
+im_field    = "external_id"

@@ -1,0 +1,140 @@
+# Visa — International card scheme
+# Dialect: no length header, BCD MTI, BCD amounts/PAN, EBCDIC on some links.
+
+[meta]
+id      = "visa"
+version = "1.0"
+
+[transport]
+header_type = "none"
+
+[encoding]
+default = "ASCII"
+mti     = "BCD"
+
+[[fields]]
+id       = 2
+name     = "PAN"
+type     = "LLVAR"
+encoding = "BCD"
+length   = 19
+
+[[fields]]
+id       = 3
+name     = "ProcessingCode"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 6
+
+[[fields]]
+id       = 4
+name     = "Amount"
+type     = "FIXED"
+encoding = "BCD"
+length   = 12
+
+[[fields]]
+id       = 7
+name     = "TransmissionDateTime"
+type     = "FIXED"
+encoding = "BCD"
+length   = 10
+
+[[fields]]
+id       = 11
+name     = "STAN"
+type     = "FIXED"
+encoding = "BCD"
+length   = 6
+
+[[fields]]
+id       = 12
+name     = "LocalTransactionTime"
+type     = "FIXED"
+encoding = "BCD"
+length   = 6
+
+[[fields]]
+id       = 13
+name     = "LocalTransactionDate"
+type     = "FIXED"
+encoding = "BCD"
+length   = 4
+
+[[fields]]
+id       = 14
+name     = "ExpirationDate"
+type     = "FIXED"
+encoding = "BCD"
+length   = 4
+
+[[fields]]
+id       = 22
+name     = "POSEntryMode"
+type     = "FIXED"
+encoding = "BCD"
+length   = 3
+
+[[fields]]
+id       = 37
+name     = "RetrievalReferenceNumber"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 12
+
+[[fields]]
+id       = 38
+name     = "AuthorizationCode"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 6
+
+[[fields]]
+id       = 39
+name     = "ResponseCode"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 2
+
+[[fields]]
+id       = 41
+name     = "TerminalID"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 8
+
+[[fields]]
+id       = 42
+name     = "MerchantID"
+type     = "FIXED"
+encoding = "ASCII"
+length   = 15
+
+[[fields]]
+id       = 49
+name     = "CurrencyCode"
+type     = "FIXED"
+encoding = "BCD"
+length   = 3
+
+[[fields]]
+id        = 55
+name      = "EMVData"
+type      = "LLLVAR"
+encoding  = "BINARY"
+length    = 999
+subschema = "emv_tlv"
+
+[[fields]]
+id       = 60
+name     = "AdditionalPOSInfo"
+type     = "LLLVAR"
+encoding = "ASCII"
+length   = 999
+
+[[fields]]
+id       = 62
+name     = "AdditionalData"
+type     = "LLLVAR"
+encoding = "ASCII"
+length   = 999
