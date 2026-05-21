@@ -37,7 +37,15 @@
       "Bash(./.zig-cache/o/fe7337ff4aab0aa0cf0aad635d12077a/test)",
       "Bash(echo \"broker exit: $?\")",
       "Bash(grep -i \"init\\\\|{$\")",
-      "Bash(lsof -iTCP -sTCP:LISTEN -n)"
+      "Bash(lsof -iTCP -sTCP:LISTEN -n)",
+      "Bash(chmod +x /Users/hierat/Desktop/orus-suite/scripts/run.sh)",
+      "Bash(grep -r \"sigaction\" /opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/posix.zig 2>/dev/null | grep \"pub fn\\\\|Sigaction\\\\|handler\" | head -15)",
+      "Read(//opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/**)",
+      "Bash(find /opt/homebrew/Cellar/zig/0.16.0/lib/zig -name \"*.zig\" | xargs grep -l \"Sigaction\" 2>/dev/null | head -5)",
+      "Read(//opt/homebrew/Cellar/zig/0.16.0/lib/zig/**)",
+      "Bash(grep -r \"std.posix.getenv\\\\|posix\\\\.getenv\" /usr/local/lib/zig/std/ 2>/dev/null | head -5 || grep -r \"posix.getenv\" ~/.zvm/0.16.0/files/lib/std/ 2>/dev/null | head -5 || zig env 2>/dev/null | head -5)",
+      "Read(//usr/local/lib/zig/**)",
+      "Read(//Users/hierat/.zvm/0.16.0/files/lib/**)"
     ]
   }
 }

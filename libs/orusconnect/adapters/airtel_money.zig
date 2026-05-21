@@ -286,7 +286,9 @@ test "AirtelMoneyAdapter: unauthorized without token" {
     var schema = toml.AdapterSchema{
         .id = "airtel_money", .version = "1.0", .auth_type = "oauth2",
         .mti_debit = "0200".*, .mti_credit = "0200".*,
-        .endpoints = .{}, .field_mappings = &.{}, .alloc = alloc,
+        .endpoints = .{}, .field_mappings = &.{},
+        .routing = .{}, .http = .{}, .env = .{}, .callback = .{}, .request = .{}, .outbound = .{},
+        .alloc = alloc,
     };
     defer schema.deinit();
 
@@ -315,7 +317,9 @@ test "AirtelMoneyAdapter: bad request on missing msisdn" {
     var schema = toml.AdapterSchema{
         .id = "airtel_money", .version = "1.0", .auth_type = "oauth2",
         .mti_debit = "0200".*, .mti_credit = "0200".*,
-        .endpoints = .{}, .field_mappings = &.{}, .alloc = alloc,
+        .endpoints = .{}, .field_mappings = &.{},
+        .routing = .{}, .http = .{}, .env = .{}, .callback = .{}, .request = .{}, .outbound = .{},
+        .alloc = alloc,
     };
     defer schema.deinit();
 
@@ -357,7 +361,9 @@ test "AirtelMoneyAdapter: callback updates state" {
     var schema = toml.AdapterSchema{
         .id = "airtel_money", .version = "1.0", .auth_type = "oauth2",
         .mti_debit = "0200".*, .mti_credit = "0200".*,
-        .endpoints = .{}, .field_mappings = &.{}, .alloc = alloc,
+        .endpoints = .{}, .field_mappings = &.{},
+        .routing = .{}, .http = .{}, .env = .{}, .callback = .{}, .request = .{}, .outbound = .{},
+        .alloc = alloc,
     };
     defer schema.deinit();
 

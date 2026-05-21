@@ -10,8 +10,9 @@ pub const auth = struct {
 };
 
 pub const adapters = struct {
-    pub const mtn_momo = @import("adapters/mtn_momo.zig");
+    pub const mtn_momo    = @import("adapters/mtn_momo.zig");
     pub const airtel_money = @import("adapters/airtel_money.zig");
+    pub const generic_momo = @import("adapters/generic_momo.zig");
 };
 
 pub const state = struct {
@@ -39,4 +40,5 @@ test {
     _ = @import("router.zig");
     _ = @import("adapters/mtn_momo.zig");
     _ = @import("adapters/airtel_money.zig");
+    _ = @import("adapters/generic_momo.zig");
 }

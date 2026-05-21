@@ -316,6 +316,7 @@ test "MtnMomoAdapter: unauthorized without token" {
         .mti_credit = "0200".*,
         .endpoints = .{},
         .field_mappings = &.{},
+        .routing = .{}, .http = .{}, .env = .{}, .callback = .{}, .request = .{}, .outbound = .{},
         .alloc = alloc,
     };
     defer schema.deinit();
@@ -355,6 +356,7 @@ test "MtnMomoAdapter: bad request on missing msisdn" {
         .mti_credit = "0200".*,
         .endpoints = .{},
         .field_mappings = &.{},
+        .routing = .{}, .http = .{}, .env = .{}, .callback = .{}, .request = .{}, .outbound = .{},
         .alloc = alloc,
     };
     defer schema.deinit();
@@ -402,7 +404,9 @@ test "MtnMomoAdapter: callback updates state" {
     var schema = toml.AdapterSchema{
         .id = "mtn_momo", .version = "1.0", .auth_type = "oauth2",
         .mti_debit = "0200".*, .mti_credit = "0200".*,
-        .endpoints = .{}, .field_mappings = &.{}, .alloc = alloc,
+        .endpoints = .{}, .field_mappings = &.{},
+        .routing = .{}, .http = .{}, .env = .{}, .callback = .{}, .request = .{}, .outbound = .{},
+        .alloc = alloc,
     };
     defer schema.deinit();
 

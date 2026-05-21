@@ -34,13 +34,55 @@ const Config = struct {
     iso_listen_host: []const u8,
     iso_listen_port: u16,
     iso_schema_name: []const u8, // "gimac" | "visa" | "mastercard"
+    iso_schema_path: ?[]const u8, // if set, load from filesystem instead of embedded
     broker_host: []const u8,
     broker_port: u16,
+    health_port: u16,
 };
 
 fn getenv(name: [:0]const u8) ?[]const u8 {
     const raw = std.c.getenv(name.ptr) orelse return null;
     return std.mem.span(raw);
+}
+
+// ── Signal handling ───────────────────────────────────────────────────────────
+
+fn handleSignal(sig: std.posix.SIG) callconv(.c) void {
+    _ = sig;
+    std.process.exit(0);
+}
+
+fn installSignalHandlers() void {
+    const sa = std.posix.Sigaction{
+        .handler = .{ .handler = handleSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+    std.posix.sigaction(std.posix.SIG.INT,  &sa, null);
+}
+
+// ── Health check ──────────────────────────────────────────────────────────────
+
+const HealthArgs = struct { port: u16, io: std.Io };
+
+fn serveHealth(args: *HealthArgs) void {
+    const addr = std.Io.net.IpAddress.parse("0.0.0.0", args.port) catch return;
+    var srv = addr.listen(args.io, .{ .reuse_address = true }) catch return;
+    defer srv.deinit(args.io);
+    const resp =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Content-Length: 2\r\n" ++
+        "Connection: close\r\n\r\nOK";
+    while (true) {
+        const stream = srv.accept(args.io) catch continue;
+        var wbuf: [256]u8 = undefined;
+        var sw = stream.writer(args.io, &wbuf);
+        sw.interface.writeAll(resp) catch {};
+        sw.interface.flush() catch {};
+        stream.close(args.io);
+    }
 }
 
 fn envU16(name: [:0]const u8, default: u16) u16 {
@@ -84,6 +126,11 @@ fn loadConfig(alloc: std.mem.Allocator) !Config {
     else
         try alloc.dupe(u8, "gimac");
 
+    const schema_path = if (getenv("GATEWAY_ISO_SCHEMA_PATH")) |s|
+        try alloc.dupe(u8, s)
+    else
+        null;
+
     return .{
         .listen_host     = listen_host,
         .listen_port     = envU16("GATEWAY_LISTEN_PORT", 7780),
@@ -94,8 +141,10 @@ fn loadConfig(alloc: std.mem.Allocator) !Config {
         .iso_listen_host = iso_host,
         .iso_listen_port = envU16("GATEWAY_ISO_PORT", 7581),
         .iso_schema_name = schema_name,
+        .iso_schema_path = schema_path,
         .broker_host     = broker_host,
         .broker_port     = envU16("BROKER_PORT", 7770),
+        .health_port     = envU16("GATEWAY_HEALTH_PORT", 7781),
     };
 }
 
@@ -189,13 +238,18 @@ fn sendError(w: *std.Io.Writer, code: u8) std.Io.Writer.Error!void {
 
 const schemas = @import("schemas");
 
-fn resolveIsoSchema(name: []const u8, alloc: std.mem.Allocator) !schema_mod.IsoSchema {
-    const src = if (std.mem.eql(u8, name, "visa"))
+fn resolveIsoSchema(config: Config, io: std.Io, alloc: std.mem.Allocator) !schema_mod.IsoSchema {
+    if (config.iso_schema_path) |path| {
+        const src = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, path, alloc, std.Io.Limit.limited(512 * 1024));
+        defer alloc.free(src);
+        return parseIsoSchema(src, alloc);
+    }
+    const src = if (std.mem.eql(u8, config.iso_schema_name, "visa"))
         schemas.iso8583.visa
-    else if (std.mem.eql(u8, name, "mastercard"))
+    else if (std.mem.eql(u8, config.iso_schema_name, "mastercard"))
         schemas.iso8583.mastercard
     else
-        schemas.iso8583.gimac; // default: GIMAC
+        schemas.iso8583.gimac;
     return parseIsoSchema(src, alloc);
 }
 
@@ -258,15 +312,22 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
+    installSignalHandlers();
+
     const config = try loadConfig(alloc);
     defer alloc.free(config.listen_host);
     defer alloc.free(config.bank_host);
     defer alloc.free(config.iso_listen_host);
     defer alloc.free(config.broker_host);
     defer alloc.free(config.iso_schema_name);
+    defer if (config.iso_schema_path) |p| alloc.free(p);
 
     var threaded = std.Io.Threaded.init(alloc, .{});
     const io = threaded.io();
+
+    var health_args = HealthArgs{ .port = config.health_port, .io = io };
+    const health_thread = try std.Thread.spawn(.{}, serveHealth, .{&health_args});
+    health_thread.detach();
 
     // ── Direction 1: InternalMessage listener (broker pushes to us) ─────────
     const gw = Gateway.init(BankClient.init(.{
@@ -276,7 +337,7 @@ pub fn main() !void {
     }, io), envU64("PAN_HASH_SEED", 0));
 
     // ── Direction 2: ISO 8583 listener (bank/switch connects to us) ─────────
-    var iso_schema = try resolveIsoSchema(config.iso_schema_name, alloc);
+    var iso_schema = try resolveIsoSchema(config, io, alloc);
     defer iso_schema.deinit();
 
     const broker_gw = GatewayBrokerClient.init(.{

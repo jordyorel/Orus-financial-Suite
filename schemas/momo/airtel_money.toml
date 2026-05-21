@@ -1,29 +1,55 @@
 [meta]
 id          = "airtel_money"
 version     = "1.0"
-auth_type   = "oauth2"
 mti_debit   = "0200"
 mti_credit  = "0200"
 
-[endpoints]
-transfer    = "POST /v1/airtel/payment"
-callback    = "POST /webhooks/airtel"
-status      = "GET /v1/airtel/payment/{transactionId}"
+[routing]
+msisdn_prefixes = ["24205"]
+
+[http]
+payment_path  = "/v1/airtel/payment"
+callback_path = "/webhooks/airtel"
+
+[env]
+bearer_token   = "AIRTEL_BEARER_TOKEN"
+callback_token = "AIRTEL_BEARER_TOKEN"
+api_host       = "AIRTEL_API_HOST"
+api_port       = "AIRTEL_API_PORT"
+
+[callback]
+auth_header    = "authorization"
+ref_field      = "transactionId"
+status_field   = "status"
+success_value  = "SUCCESS"
+tx_id_response = "transactionId"
+
+[request]
+msisdn_field   = "msisdn"
+amount_field   = "amount"
+currency_field = "currency"
+ref_field      = "reference"
+
+[outbound]
+msisdn_field   = "msisdn"
+amount_field   = "amount"
+currency_field = "currency"
+ref_field      = "reference"
 
 [[field_mappings]]
-json_path   = "msisdn"
-im_field    = "pan"
-transform   = "msisdn_to_pan"
+json_path  = "msisdn"
+im_field   = "pan"
+transform  = "msisdn_to_pan"
 
 [[field_mappings]]
-json_path   = "amount"
-im_field    = "amount"
-transform   = "to_centimes"
+json_path  = "amount"
+im_field   = "amount"
+transform  = "to_centimes"
 
 [[field_mappings]]
-json_path   = "currency"
-im_field    = "currency"
+json_path  = "currency"
+im_field   = "currency"
 
 [[field_mappings]]
-json_path   = "reference"
-im_field    = "external_id"
+json_path  = "reference"
+im_field   = "external_id"

@@ -1,29 +1,63 @@
 [meta]
 id          = "mtn_momo"
 version     = "1.0"
-auth_type   = "oauth2"
 mti_debit   = "0200"
 mti_credit  = "0200"
 
-[endpoints]
-transfer    = "POST /collection/v1_0/requesttopay"
-callback    = "POST /webhooks/mtn"
-status      = "GET /collection/v1_0/requesttopay/{referenceId}"
+# MSISDN prefixes that route to this operator (Congo-Brazzaville MTN).
+# Add more prefixes here to support additional countries — zero code change.
+[routing]
+msisdn_prefixes = ["24206"]
+
+# Inbound HTTP paths exposed by OrusConnect.
+[http]
+payment_path  = "/collection/v1_0/requesttopay"
+callback_path = "/webhooks/mtn"
+
+# Names of environment variables holding runtime secrets.
+# Set these variables in .env — never put values here.
+[env]
+bearer_token   = "MTN_BEARER_TOKEN"
+callback_token = "MTN_CALLBACK_TOKEN"
+api_host       = "MTN_API_HOST"
+api_port       = "MTN_API_PORT"
+
+# Callback webhook shape (sent by MTN after USSD PIN confirmation).
+[callback]
+auth_header    = "x-callback-token"
+ref_field      = "referenceId"
+status_field   = "status"
+success_value  = "SUCCESSFUL"
+tx_id_response = "referenceId"
+
+# Inbound payment request JSON field names.
+[request]
+msisdn_field   = "msisdn"
+amount_field   = "amount"
+currency_field = "currency"
+ref_field      = "externalId"
+
+# Outbound disbursement JSON field names (Direction 2: bank → MoMo).
+[outbound]
+msisdn_field   = "msisdn"
+amount_field   = "amount"
+currency_field = "currency"
+ref_field      = "externalId"
 
 [[field_mappings]]
-json_path   = "msisdn"
-im_field    = "pan"
-transform   = "msisdn_to_pan"
+json_path  = "msisdn"
+im_field   = "pan"
+transform  = "msisdn_to_pan"
 
 [[field_mappings]]
-json_path   = "amount"
-im_field    = "amount"
-transform   = "to_centimes"
+json_path  = "amount"
+im_field   = "amount"
+transform  = "to_centimes"
 
 [[field_mappings]]
-json_path   = "currency"
-im_field    = "currency"
+json_path  = "currency"
+im_field   = "currency"
 
 [[field_mappings]]
-json_path   = "externalId"
-im_field    = "external_id"
+json_path  = "externalId"
+im_field   = "external_id"

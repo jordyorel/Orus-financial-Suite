@@ -248,7 +248,7 @@ test "ApiClient: 200 response with body" {
     const t = try std.Thread.spawn(.{}, serveOnce, .{ &server, io, 200, body_str });
     defer t.join();
 
-    const client = ApiClient.init("127.0.0.1", TEST_PORT, io);
+    var client = ApiClient.init("127.0.0.1", TEST_PORT, io);
     var resp = try client.post("/v2/transfer", &.{
         .{ .name = "Content-Type", .value = "application/json" },
         .{ .name = "Authorization", .value = "Bearer tok" },
@@ -272,7 +272,7 @@ test "ApiClient: 422 response" {
     const t = try std.Thread.spawn(.{}, serveOnce, .{ &server, io, 422, "{\"error\":\"invalid\"}" });
     defer t.join();
 
-    const client = ApiClient.init("127.0.0.1", TEST_PORT + 1, io);
+    var client = ApiClient.init("127.0.0.1", TEST_PORT + 1, io);
     var resp = try client.post("/v2/transfer", &.{}, "", alloc);
     defer resp.deinit();
 

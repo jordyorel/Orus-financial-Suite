@@ -1,38 +1,41 @@
 const std = @import("std");
 const orusconnect = @import("orusconnect");
 const orusshare = @import("orusshare");
-const schemas = @import("schemas");
 
 const http = orusconnect.http_server;
 const Router = orusconnect.Router;
 const BrokerClient = orusconnect.BrokerClient;
 const PendingTxStore = orusconnect.PendingTxStore;
 const toml = orusconnect.toml;
-const pending = orusconnect.state.pending_tx;
-const mtn_mod = orusconnect.adapters.mtn_momo;
-const airtel_mod = orusconnect.adapters.airtel_money;
 const ApiClient = orusconnect.ApiClient;
+const generic_momo = orusconnect.adapters.generic_momo;
+const GenericMoMoAdapter = generic_momo.GenericMoMoAdapter;
 
-// ── Route handler shims ───────────────────────────────────────────────────────
+// ── Signal handling ───────────────────────────────────────────────────────────
 
-fn mtnTransferFn(ctx: *anyopaque, req: *http.HttpRequest, alloc: std.mem.Allocator) http.HttpResponse {
-    const a: *mtn_mod.MtnMomoAdapter = @ptrCast(@alignCast(ctx));
-    return a.handleRequestToPay(req, alloc);
+fn handleSignal(sig: std.posix.SIG) callconv(.c) void {
+    _ = sig;
+    std.process.exit(0);
 }
 
-fn mtnCallbackFn(ctx: *anyopaque, req: *http.HttpRequest, alloc: std.mem.Allocator) http.HttpResponse {
-    const a: *mtn_mod.MtnMomoAdapter = @ptrCast(@alignCast(ctx));
-    return a.handleCallback(req, alloc);
+fn installSignalHandlers() void {
+    const sa = std.posix.Sigaction{
+        .handler = .{ .handler = handleSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+    std.posix.sigaction(std.posix.SIG.INT,  &sa, null);
 }
 
-fn airtelPaymentFn(ctx: *anyopaque, req: *http.HttpRequest, alloc: std.mem.Allocator) http.HttpResponse {
-    const a: *airtel_mod.AirtelMoneyAdapter = @ptrCast(@alignCast(ctx));
-    return a.handlePayment(req, alloc);
+// ── Generic route shims ───────────────────────────────────────────────────────
+
+fn paymentFn(ctx: *anyopaque, req: *http.HttpRequest, alloc: std.mem.Allocator) http.HttpResponse {
+    return (@as(*GenericMoMoAdapter, @ptrCast(@alignCast(ctx)))).handlePayment(req, alloc);
 }
 
-fn airtelCallbackFn(ctx: *anyopaque, req: *http.HttpRequest, alloc: std.mem.Allocator) http.HttpResponse {
-    const a: *airtel_mod.AirtelMoneyAdapter = @ptrCast(@alignCast(ctx));
-    return a.handleCallback(req, alloc);
+fn callbackFn(ctx: *anyopaque, req: *http.HttpRequest, alloc: std.mem.Allocator) http.HttpResponse {
+    return (@as(*GenericMoMoAdapter, @ptrCast(@alignCast(ctx)))).handleCallback(req, alloc);
 }
 
 fn healthFn(ctx: *anyopaque, req: *http.HttpRequest, alloc: std.mem.Allocator) http.HttpResponse {
@@ -44,74 +47,42 @@ fn healthFn(ctx: *anyopaque, req: *http.HttpRequest, alloc: std.mem.Allocator) h
 
 // ── Direction 2: broker → MoMo dispatch ──────────────────────────────────────
 
-// MSISDN prefix → provider routing (Congo-Brazzaville +242).
-// Field 2 carries the full MSISDN (e.g. "242065001234").
-// Extend this table when adding new countries or operators.
-const MsisdnPrefix = struct {
-    prefix: []const u8,
-    provider: orusshare.ServiceProvider,
-};
-const MSISDN_PREFIXES = [_]MsisdnPrefix{
-    .{ .prefix = "24206", .provider = .mtn_momo    }, // MTN Congo (+242 06)
-    .{ .prefix = "24205", .provider = .airtel_money }, // Airtel Congo (+242 05)
+// MSISDN prefix routing table — built dynamically at startup from TOML schemas.
+const PrefixEntry = struct {
+    prefix:  []const u8,
+    adapter: *GenericMoMoAdapter,
 };
 
-fn providerFromMsisdn(msisdn: []const u8) ?orusshare.ServiceProvider {
-    for (MSISDN_PREFIXES) |entry| {
-        if (std.mem.startsWith(u8, msisdn, entry.prefix)) return entry.provider;
-    }
-    return null;
-}
+const DispatchCtx = struct {
+    prefixes: []const PrefixEntry,
+    alloc:    std.mem.Allocator,
+};
 
 fn findField(fields: []const orusshare.InternalMessage.FieldEntry, id: u8) ?[]const u8 {
     for (fields) |f| if (f.id == id) return f.value;
     return null;
 }
 
-const DispatchCtx = struct {
-    mtn:          *const mtn_mod.MtnMomoAdapter,
-    airtel:       *const airtel_mod.AirtelMoneyAdapter,
-    mtn_client:   ApiClient,
-    airtel_client: ApiClient,
-    alloc:        std.mem.Allocator,
-};
-
 fn onDispatch(msg: *const orusshare.InternalMessage, raw_ctx: ?*anyopaque) void {
-    const ctx: *DispatchCtx = @ptrCast(@alignCast(raw_ctx.?));
+    const ctx: *const DispatchCtx = @ptrCast(@alignCast(raw_ctx.?));
 
-    // Resolve provider: trust msg.provider when set, else derive from MSISDN (field 2).
-    const provider: orusshare.ServiceProvider = if (msg.provider != .none)
-        msg.provider
-    else blk: {
-        const msisdn = findField(msg.fields, 2) orelse {
-            std.log.warn("dispatch: no provider and no MSISDN (field 2) for msg_id={s}", .{
-                std.fmt.bytesToHex(msg.msg_id, .lower),
-            });
-            return;
-        };
-        break :blk providerFromMsisdn(msisdn) orelse {
-            std.log.warn("dispatch: unknown MSISDN prefix '{s}' for msg_id={s}", .{
-                msisdn, std.fmt.bytesToHex(msg.msg_id, .lower),
-            });
-            return;
-        };
+    const msisdn = findField(msg.fields, 2) orelse {
+        std.log.warn("dispatch: no MSISDN (field 2) in msg_id={s}", .{
+            std.fmt.bytesToHex(msg.msg_id, .lower),
+        });
+        return;
     };
 
-    switch (provider) {
-        .mtn_momo => {
-            _ = mtn_mod.dispatch(ctx.mtn, msg, &ctx.mtn_client, ctx.alloc) catch |err| {
-                std.log.warn("dispatch: MTN failed: {}", .{err});
+    for (ctx.prefixes) |entry| {
+        if (std.mem.startsWith(u8, msisdn, entry.prefix)) {
+            _ = generic_momo.dispatch(entry.adapter, msg, ctx.alloc) catch |err| {
+                std.log.warn("dispatch: prefix {s} failed: {}", .{ entry.prefix, err });
             };
-        },
-        .airtel_money => {
-            _ = airtel_mod.dispatch(ctx.airtel, msg, &ctx.airtel_client, ctx.alloc) catch |err| {
-                std.log.warn("dispatch: Airtel failed: {}", .{err});
-            };
-        },
-        else => {
-            std.log.warn("dispatch: provider {s} not handled", .{@tagName(provider)});
-        },
+            return;
+        }
     }
+
+    std.log.warn("dispatch: no adapter for MSISDN prefix '{s}'", .{msisdn});
 }
 
 const ConsumeArgs = struct {
@@ -152,11 +123,17 @@ fn envU64(name: [:0]const u8, default: u64) u64 {
     return std.fmt.parseInt(u64, s, 10) catch default;
 }
 
-fn require(name: [:0]const u8) []const u8 {
-    return getenv(name) orelse {
-        std.log.err("Required env var {s} is not set", .{name});
-        std.process.exit(1);
-    };
+// Resolve an env var whose name comes from a TOML schema (non-null-terminated slice).
+fn resolveEnvVar(name: []const u8, alloc: std.mem.Allocator) ?[]const u8 {
+    if (name.len == 0) return null;
+    const name_z = alloc.dupeZ(u8, name) catch return null;
+    defer alloc.free(name_z);
+    const raw = std.c.getenv(name_z.ptr) orelse return null;
+    return std.mem.span(raw);
+}
+
+fn parsePort(s: []const u8, default: u16) u16 {
+    return std.fmt.parseInt(u16, s, 10) catch default;
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -166,82 +143,143 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    // Parse schemas (embedded at compile time via schemas module)
-    var mtn_schema = toml.parseAdapterSchema(schemas.mtn_momo, alloc) catch |err| {
-        std.log.err("Failed to parse MTN schema: {}", .{err});
-        return err;
-    };
-    defer mtn_schema.deinit();
+    installSignalHandlers();
 
-    var airtel_schema = toml.parseAdapterSchema(schemas.airtel_money, alloc) catch |err| {
-        std.log.err("Failed to parse Airtel schema: {}", .{err});
-        return err;
-    };
-    defer airtel_schema.deinit();
-
-    // Shared pending transaction store
-    var tx_store = PendingTxStore.init(alloc);
-    defer tx_store.deinit();
-
-    // Io runtime for broker connections and timestamps
     var threaded = std.Io.Threaded.init(alloc, .{});
     const io = threaded.io();
+
+    var tx_store = PendingTxStore.init(alloc);
+    defer tx_store.deinit();
 
     const broker = BrokerClient.init(.{
         .host = getenv("BROKER_HOST") orelse "127.0.0.1",
         .port = envU16("BROKER_PORT", 7770),
     }, io);
 
-    // Adapters
     const pan_seed = envU64("PAN_HASH_SEED", 0);
 
-    var mtn = mtn_mod.MtnMomoAdapter.init(
-        mtn_schema,
-        require("MTN_BEARER_TOKEN"),
-        require("MTN_CALLBACK_TOKEN"),
-        &tx_store,
-        &broker,
-        pan_seed,
-    );
+    // ── Load adapters from TOML schema directory ──────────────────────────────
 
-    var airtel = airtel_mod.AirtelMoneyAdapter.init(
-        airtel_schema,
-        require("AIRTEL_BEARER_TOKEN"),
-        &tx_store,
-        &broker,
-        pan_seed,
-    );
+    var adapters_list: std.ArrayList(*GenericMoMoAdapter) = .empty;
+    defer {
+        for (adapters_list.items) |a| {
+            a.schema.deinit();
+            alloc.destroy(a);
+        }
+        adapters_list.deinit(alloc);
+    }
 
-    // Direction 2: consume loop (broker → MoMo dispatch)
-    const mtn_api_host  = getenv("MTN_API_HOST")    orelse "127.0.0.1";
-    const mtn_api_port  = envU16("MTN_API_PORT",  8090);
-    const airtel_api_host = getenv("AIRTEL_API_HOST") orelse "127.0.0.1";
-    const airtel_api_port = envU16("AIRTEL_API_PORT", 8091);
+    // TOML source buffers must outlive the adapter schemas (strings point into them).
+    var src_bufs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (src_bufs.items) |b| alloc.free(b);
+        src_bufs.deinit(alloc);
+    }
+
+    var prefix_list: std.ArrayList(PrefixEntry) = .empty;
+    defer prefix_list.deinit(alloc);
+
+    var router = Router.init(alloc);
+    defer router.deinit();
+
+    const schema_dir_path = getenv("CONNECT_SCHEMA_DIR") orelse "./schemas/momo";
+
+    {
+        const cwd = std.Io.Dir.cwd();
+        const schema_dir = std.Io.Dir.openDir(cwd, io, schema_dir_path, .{ .iterate = true }) catch |err| {
+            std.log.err("Cannot open schema dir '{s}': {}", .{ schema_dir_path, err });
+            return err;
+        };
+        defer std.Io.Dir.close(schema_dir, io);
+
+        var it = std.Io.Dir.iterate(schema_dir);
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".toml")) continue;
+
+            const src = std.Io.Dir.readFileAlloc(schema_dir, io, entry.name, alloc, std.Io.Limit.limited(512 * 1024)) catch |err| {
+                std.log.warn("Failed to read '{s}': {}", .{ entry.name, err });
+                continue;
+            };
+
+            var schema = toml.parseAdapterSchema(src, alloc) catch |err| {
+                std.log.warn("Failed to parse '{s}': {}", .{ entry.name, err });
+                alloc.free(src);
+                continue;
+            };
+            try src_bufs.append(alloc, src);
+
+            const bearer = resolveEnvVar(schema.env.bearer_token, alloc) orelse {
+                std.log.warn("Env var '{s}' not set for adapter '{s}', skipping", .{
+                    schema.env.bearer_token, schema.id,
+                });
+                schema.deinit();
+                _ = src_bufs.pop();
+                alloc.free(src);
+                continue;
+            };
+
+            const callback_tok = if (schema.env.callback_token.len > 0)
+                resolveEnvVar(schema.env.callback_token, alloc) orelse bearer
+            else
+                bearer;
+
+            const api_host = if (schema.env.api_host.len > 0)
+                resolveEnvVar(schema.env.api_host, alloc) orelse "127.0.0.1"
+            else
+                "127.0.0.1";
+
+            const api_port: u16 = if (schema.env.api_port.len > 0) blk: {
+                const port_str = resolveEnvVar(schema.env.api_port, alloc) orelse break :blk @as(u16, 8090);
+                break :blk parsePort(port_str, 8090);
+            } else 8090;
+
+            const api = ApiClient.init(api_host, api_port, io);
+
+            const adapter_ptr = try alloc.create(GenericMoMoAdapter);
+            adapter_ptr.* = GenericMoMoAdapter.init(
+                schema, bearer, callback_tok, &tx_store, &broker, api, pan_seed,
+            );
+            try adapters_list.append(alloc, adapter_ptr);
+
+            if (schema.http.payment_path.len > 0)
+                try router.add(.POST, schema.http.payment_path, adapter_ptr, paymentFn);
+            if (schema.http.callback_path.len > 0)
+                try router.add(.POST, schema.http.callback_path, adapter_ptr, callbackFn);
+
+            for (schema.routing.msisdn_prefixes) |prefix| {
+                try prefix_list.append(alloc, .{ .prefix = prefix, .adapter = adapter_ptr });
+            }
+
+            std.log.info("Loaded adapter '{s}' ({d} prefix(es), payment={s})", .{
+                schema.id,
+                schema.routing.msisdn_prefixes.len,
+                schema.http.payment_path,
+            });
+        }
+    }
+
+    if (adapters_list.items.len == 0) {
+        std.log.warn("No adapters loaded from '{s}' — all payment requests will be rejected", .{
+            schema_dir_path,
+        });
+    }
+
+    var dummy: u8 = 0;
+    try router.add(.GET, "/health", &dummy, healthFn);
+
+    // ── Direction 2: consume broker → dispatch to MoMo ────────────────────────
 
     var dispatch_ctx = DispatchCtx{
-        .mtn          = &mtn,
-        .airtel       = &airtel,
-        .mtn_client   = ApiClient.init(mtn_api_host,    mtn_api_port,    io),
-        .airtel_client = ApiClient.init(airtel_api_host, airtel_api_port, io),
-        .alloc        = alloc,
+        .prefixes = prefix_list.items,
+        .alloc    = alloc,
     };
     var consume_args = ConsumeArgs{ .broker = &broker, .ctx = &dispatch_ctx, .alloc = alloc };
     const consume_thread = try std.Thread.spawn(.{}, consumeLoop, .{&consume_args});
     consume_thread.detach();
 
-    // Router
-    var router = Router.init(alloc);
-    defer router.deinit();
+    // ── HTTP server ───────────────────────────────────────────────────────────
 
-    try router.add(.POST, "/collection/v1_0/requesttopay", &mtn, mtnTransferFn);
-    try router.add(.POST, "/webhooks/mtn",                 &mtn, mtnCallbackFn);
-    try router.add(.POST, "/v1/airtel/payment",            &airtel, airtelPaymentFn);
-    try router.add(.POST, "/webhooks/airtel",              &airtel, airtelCallbackFn);
-
-    var dummy: u8 = 0;
-    try router.add(.GET, "/health", &dummy, healthFn);
-
-    // HTTP server
     const listen_host = getenv("CONNECT_LISTEN_HOST") orelse "0.0.0.0";
     const listen_port = envU16("CONNECT_LISTEN_PORT", 8080);
 
@@ -250,10 +288,12 @@ pub fn main() !void {
         .port = listen_port,
     });
 
-    std.log.info("OrusConnect listening on {s}:{d}  broker={s}:{d}", .{
-        listen_host, listen_port,
+    std.log.info("OrusConnect listening on {s}:{d}  broker={s}:{d}  {d} adapter(s)", .{
+        listen_host,
+        listen_port,
         getenv("BROKER_HOST") orelse "127.0.0.1",
         envU16("BROKER_PORT", 7770),
+        adapters_list.items.len,
     });
 
     var h = router.handler();
