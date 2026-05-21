@@ -37,7 +37,8 @@ pub const Wal = struct {
         std.Io.File.close(self.file, self.io);
     }
 
-    pub fn append(self: *Wal, payload: []const u8) !void {
+    // Append payload; returns the byte offset of the entry start (for cursor tracking).
+    pub fn appendGetOffset(self: *Wal, payload: []const u8) !u64 {
         const crc: u32 = std.hash.Crc32.hash(payload);
         const len: u32 = @intCast(payload.len);
 
@@ -49,11 +50,69 @@ pub const Wal = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        const start = self.offset;
         try std.Io.File.writePositionalAll(self.file, self.io, &hdr, self.offset);
         self.offset += HDR_LEN;
         try std.Io.File.writePositionalAll(self.file, self.io, payload, self.offset);
         self.offset += payload.len;
         try std.Io.File.sync(self.file, self.io);
+        return start;
+    }
+
+    pub fn append(self: *Wal, payload: []const u8) !void {
+        _ = try self.appendGetOffset(payload);
+    }
+
+    // Current write position (byte offset of the next entry to be appended).
+    pub fn currentOffset(self: *Wal) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.offset;
+    }
+
+    // Replay every valid entry in [start, end).
+    // Calls cb(payload, next_offset, ctx) for each entry; `next_offset` is the
+    // byte offset immediately after this entry — the value to persist as cursor.
+    // Stops cleanly at `end`; returns WalError.Corrupt on integrity failures.
+    // Reads without holding the mutex (WAL is append-only; positional reads are safe).
+    pub fn replayFrom(
+        self:  *Wal,
+        start: u64,
+        end:   u64,
+        alloc: std.mem.Allocator,
+        cb:    *const fn (payload: []const u8, next_offset: u64, ctx: ?*anyopaque) void,
+        ctx:   ?*anyopaque,
+    ) WalError!void {
+        var pos: u64 = start;
+
+        while (pos + HDR_LEN <= end) {
+            var hdr: [12]u8 = undefined;
+            const hn = std.Io.File.readPositionalAll(self.file, self.io, &hdr, pos) catch
+                return error.Corrupt;
+            if (hn == 0) break;
+            if (hn < HDR_LEN) return error.Corrupt;
+
+            const magic        = std.mem.readInt(u32, hdr[0..4],  .big);
+            const expected_crc = std.mem.readInt(u32, hdr[4..8],  .big);
+            const length       = std.mem.readInt(u32, hdr[8..12], .big);
+
+            if (magic != MAGIC) return error.Corrupt;
+            if (pos + HDR_LEN + length > end) return error.Corrupt;
+
+            const payload = alloc.alloc(u8, length) catch return error.OutOfMemory;
+            defer alloc.free(payload);
+
+            const pn = std.Io.File.readPositionalAll(self.file, self.io, payload, pos + HDR_LEN) catch
+                return error.Corrupt;
+            if (pn < length) return error.Corrupt;
+
+            const actual_crc: u32 = std.hash.Crc32.hash(payload);
+            if (actual_crc != expected_crc) return error.Corrupt;
+
+            const next_offset = pos + HDR_LEN + length;
+            cb(payload, next_offset, ctx);
+            pos = next_offset;
+        }
     }
 
     // Replay every valid entry from byte offset 0.

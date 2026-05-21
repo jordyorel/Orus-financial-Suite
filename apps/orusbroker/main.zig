@@ -19,9 +19,10 @@ pub fn main() !void {
     var threaded = std.Io.Threaded.init(alloc, .{});
     const io = threaded.io();
 
-    const host     = getenv("BROKER_HOST")     orelse "0.0.0.0";
-    const port     = envU16("BROKER_PORT",     7770);
-    const wal_path = getenv("BROKER_WAL_FILE") orelse "orus_broker.wal";
+    const host       = getenv("BROKER_HOST")        orelse "0.0.0.0";
+    const port       = envU16("BROKER_PORT",        7770);
+    const wal_path   = getenv("BROKER_WAL_FILE")    orelse "orus_broker.wal";
+    const cursor_dir = getenv("BROKER_CURSOR_DIR")  orelse "/tmp/orus_cursors";
 
     var wal = try orusbroker.Wal.open(io, wal_path);
     defer wal.close();
@@ -30,12 +31,20 @@ pub fn main() !void {
     var router = orusbroker.TopicRouter.init(alloc);
     defer router.deinit();
 
+    const config = orusbroker.Config{
+        .host       = host,
+        .port       = port,
+        .wal_path   = wal_path,
+        .cursor_dir = cursor_dir,
+    };
+
     const server = orusbroker.BrokerServer{
-        .config = .{ .host = host, .port = port, .wal_path = wal_path },
+        .config = config,
         .io     = io,
         .wal    = &wal,
         .dedup  = &dedup,
         .router = &router,
+        .cursor = orusbroker.Cursor.init(cursor_dir, io),
     };
 
     try server.serve(alloc);

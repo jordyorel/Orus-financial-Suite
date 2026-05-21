@@ -159,12 +159,19 @@ test "Battle: 20 threads × 50 publishes — aucune erreur, aucun crash" {
     inner.wal    = try Wal.open(io, path);
     inner.dedup  = DedupFilter.init();
     inner.router = TopicRouter.init(std.heap.page_allocator);
+    const battle_config = orusbroker.Config{
+        .host       = "127.0.0.1",
+        .port       = PORT_CONCURRENT,
+        .wal_path   = path,
+        .cursor_dir = "/tmp/orus_battle_cursors",
+    };
     inner.server = BrokerServer{
-        .config = .{ .host = "127.0.0.1", .port = PORT_CONCURRENT, .wal_path = path },
+        .config = battle_config,
         .io     = io,
         .wal    = &inner.wal,
         .dedup  = &inner.dedup,
         .router = &inner.router,
+        .cursor = orusbroker.Cursor.init(battle_config.cursor_dir, io),
     };
     const srv_thread = try std.Thread.spawn(.{}, runServer, .{inner});
     defer srv_thread.detach();

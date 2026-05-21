@@ -5,21 +5,23 @@
 //   2. Read the first frame header → determine PUBLISH or SUBSCRIBE.
 //   3a. PUBLISH: dedup → WAL append → fan-out DELIVER → send PUBLISH_ACK.
 //       Connection closes after the single exchange.
-//   3b. SUBSCRIBE: register Sub → loop reading ACK frames until disconnect.
-//       Publisher threads push DELIVER frames to the stream concurrently.
+//   3b. SUBSCRIBE: read cursor, replay WAL, register Sub, loop reading ACK
+//       frames until disconnect. On each ACK, persist cursor.
 
-const std      = @import("std");
-const orusshare = @import("orusshare");
-const serialize = orusshare.serialize;
-const proto    = @import("protocol.zig");
-const wal_mod  = @import("wal.zig");
-const dedup_mod = @import("dedup.zig");
+const std        = @import("std");
+const orusshare  = @import("orusshare");
+const serialize  = orusshare.serialize;
+const proto      = @import("protocol.zig");
+const wal_mod    = @import("wal.zig");
+const dedup_mod  = @import("dedup.zig");
 const topics_mod = @import("topics.zig");
+const cursor_mod = @import("cursor.zig");
 
 pub const Config = struct {
-    host:     []const u8 = "0.0.0.0",
-    port:     u16        = 7770,
-    wal_path: []const u8 = "orus_broker.wal",
+    host:       []const u8 = "0.0.0.0",
+    port:       u16        = 7770,
+    wal_path:   []const u8 = "orus_broker.wal",
+    cursor_dir: []const u8 = "/tmp/orus_cursors",
 };
 
 pub const BrokerServer = struct {
@@ -28,6 +30,7 @@ pub const BrokerServer = struct {
     wal:    *wal_mod.Wal,
     dedup:  *dedup_mod.DedupFilter,
     router: *topics_mod.TopicRouter,
+    cursor: cursor_mod.Cursor,
 
     // Blocking accept loop — runs until the listener is closed.
     pub fn serve(self: *const BrokerServer, alloc: std.mem.Allocator) !void {
@@ -35,8 +38,9 @@ pub const BrokerServer = struct {
         var server = try addr.listen(self.io, .{ .reuse_address = true });
         defer server.deinit(self.io);
 
-        std.log.info("OrusBroker listening on {s}:{d}  wal={s}", .{
-            self.config.host, self.config.port, self.config.wal_path,
+        std.log.info("OrusBroker listening on {s}:{d}  wal={s}  cursors={s}", .{
+            self.config.host, self.config.port,
+            self.config.wal_path, self.config.cursor_dir,
         });
 
         while (true) {
@@ -70,7 +74,6 @@ const ConnCtx = struct {
 };
 
 fn handleConn(ctx: *ConnCtx) void {
-    // Defers execute LIFO: destroy(ctx) must come AFTER stream.close to avoid use-after-free.
     defer ctx.alloc.destroy(ctx);
     defer ctx.stream.close(ctx.server.io);
 
@@ -96,7 +99,6 @@ fn handleConn(ctx: *ConnCtx) void {
 fn handlePublish(ctx: *ConnCtx, r: *std.Io.Reader, remaining: u32) void {
     const alloc = ctx.alloc;
 
-    // [u16 topic_len][topic][IM payload]
     var tl: [2]u8 = undefined;
     r.readSliceAll(&tl) catch return;
     const topic_len = std.mem.readInt(u16, &tl, .big);
@@ -111,7 +113,6 @@ fn handlePublish(ctx: *ConnCtx, r: *std.Io.Reader, remaining: u32) void {
     defer alloc.free(payload);
     r.readSliceAll(payload) catch return;
 
-    // Deserialize only to extract msg_id for dedup.
     var fixed_r = std.Io.Reader.fixed(payload);
     const msg = serialize.deserialize(&fixed_r, alloc) catch {
         std.log.warn("broker: publish: deserialize failed", .{});
@@ -122,12 +123,19 @@ fn handlePublish(ctx: *ConnCtx, r: *std.Io.Reader, remaining: u32) void {
 
     if (ctx.server.dedup.checkAndSet(msg.msg_id)) {
         std.log.debug("broker: duplicate msg_id discarded", .{});
-    } else {
-        ctx.server.wal.append(payload) catch |err| {
-            std.log.warn("broker: WAL append failed: {} (delivering anyway)", .{err});
-        };
-        ctx.server.router.deliver(topic, payload);
+        sendPublishAck(ctx);
+        return;
     }
+
+    const start_offset = ctx.server.wal.appendGetOffset(payload) catch |err| {
+        std.log.warn("broker: WAL append failed: {} (delivering anyway)", .{err});
+        ctx.server.router.deliver(topic, payload, 0);
+        sendPublishAck(ctx);
+        return;
+    };
+    // after_offset = offset of the next entry after this one.
+    const after_offset: u64 = start_offset + 12 + payload.len;
+    ctx.server.router.deliver(topic, payload, after_offset);
 
     sendPublishAck(ctx);
 }
@@ -139,15 +147,42 @@ fn sendPublishAck(ctx: *ConnCtx) void {
     sw.interface.flush() catch {};
 }
 
+// Context passed to replayCb during WAL replay for a reconnecting subscriber.
+const ReplayCtx = struct {
+    w:     *std.Io.Writer,
+    topic: []const u8,
+    fail:  bool,
+};
+
+fn replayCb(payload: []const u8, next_offset: u64, ctx_ptr: ?*anyopaque) void {
+    const rc: *ReplayCtx = @ptrCast(@alignCast(ctx_ptr.?));
+    if (rc.fail) return;
+
+    const topic_len: u16 = @intCast(rc.topic.len);
+    const body_len:  u32 = @intCast(1 + 2 + rc.topic.len + 8 + payload.len);
+
+    const ok: bool = blk: {
+        rc.w.writeInt(u32, body_len,           .big) catch break :blk false;
+        rc.w.writeByte(proto.FRAME_DELIVER)         catch break :blk false;
+        rc.w.writeInt(u16, topic_len,           .big) catch break :blk false;
+        rc.w.writeAll(rc.topic)                     catch break :blk false;
+        rc.w.writeInt(u64, next_offset,         .big) catch break :blk false;
+        rc.w.writeAll(payload)                      catch break :blk false;
+        rc.w.flush()                                catch break :blk false;
+        break :blk true;
+    };
+    if (!ok) rc.fail = true;
+}
+
 fn handleSubscribe(ctx: *ConnCtx, r: *std.Io.Reader, remaining: u32) void {
     const alloc = ctx.alloc;
+    _ = remaining;
 
-    // [u16 topic_len][topic]
+    // Parse topic.
     var tl: [2]u8 = undefined;
     r.readSliceAll(&tl) catch return;
     const topic_len = std.mem.readInt(u16, &tl, .big);
     if (topic_len > proto.MAX_TOPIC_LEN) return;
-    _ = remaining;
 
     const topic = alloc.alloc(u8, topic_len) catch return;
     r.readSliceAll(topic) catch {
@@ -155,6 +190,49 @@ fn handleSubscribe(ctx: *ConnCtx, r: *std.Io.Reader, remaining: u32) void {
         return;
     };
 
+    // Parse sub_id (may be empty for anonymous subscribers).
+    var sl: [2]u8 = undefined;
+    r.readSliceAll(&sl) catch {
+        alloc.free(topic);
+        return;
+    };
+    const sub_id_len = std.mem.readInt(u16, &sl, .big);
+    if (sub_id_len > proto.MAX_SUB_ID_LEN) {
+        alloc.free(topic);
+        return;
+    }
+
+    var sub_id_buf: [proto.MAX_SUB_ID_LEN]u8 = undefined;
+    const sub_id = sub_id_buf[0..sub_id_len];
+    if (sub_id_len > 0) {
+        r.readSliceAll(sub_id) catch {
+            alloc.free(topic);
+            return;
+        };
+    }
+
+    const has_cursor = proto.isValidSubId(sub_id);
+
+    // Snapshot current WAL tip; replay entries between cursor and tip.
+    const tip = ctx.server.wal.currentOffset();
+    const cursor_start: u64 = if (has_cursor) ctx.server.cursor.load(sub_id) else 0;
+
+    var write_buf: [16384]u8 = undefined;
+    var sw = ctx.stream.writer(ctx.server.io, &write_buf);
+    const w = &sw.interface;
+
+    if (has_cursor and cursor_start > 0 and cursor_start < tip) {
+        var rc = ReplayCtx{ .w = w, .topic = topic, .fail = false };
+        ctx.server.wal.replayFrom(cursor_start, tip, alloc, replayCb, &rc) catch |err| {
+            std.log.warn("broker: WAL replay failed for sub={s}: {}", .{ sub_id, err });
+        };
+        if (rc.fail) {
+            alloc.free(topic);
+            return;
+        }
+    }
+
+    // Register with router — new publishes will flow here from this point.
     const sub = alloc.create(topics_mod.Sub) catch {
         alloc.free(topic);
         return;
@@ -172,12 +250,11 @@ fn handleSubscribe(ctx: *ConnCtx, r: *std.Io.Reader, remaining: u32) void {
         return;
     };
 
-    std.log.debug("broker: subscriber registered topic={s}", .{topic});
+    std.log.debug("broker: subscriber registered topic={s} sub_id={s} cursor={d}", .{
+        topic, sub_id, cursor_start,
+    });
 
     // Loop: read ACK frames until the client disconnects.
-    // DELIVER frames are pushed to this stream by publisher threads
-    // (via router.deliver) concurrently — TCP full-duplex keeps reads
-    // and writes independent at the OS level.
     while (true) {
         var len_bytes: [4]u8 = undefined;
         r.readSliceAll(&len_bytes) catch break;
@@ -185,15 +262,15 @@ fn handleSubscribe(ctx: *ConnCtx, r: *std.Io.Reader, remaining: u32) void {
         const frame_type = r.takeByte() catch break;
 
         if (frame_type == proto.FRAME_ACK) {
-            var msg_id: [16]u8 = undefined;
-            r.readSliceAll(&msg_id) catch break;
-            // V1: ACKs are logged; WAL compaction / exactly-once cursor
-            // tracking is deferred to the M4 milestone.
-            std.log.debug("broker: ACK msg_id={s}", .{
-                std.fmt.bytesToHex(msg_id, .lower),
-            });
+            // body: [u64 wal_offset BE] — the after_offset sent in DELIVER
+            var offset_bytes: [8]u8 = undefined;
+            r.readSliceAll(&offset_bytes) catch break;
+            const wal_offset = std.mem.readInt(u64, &offset_bytes, .big);
+            if (has_cursor) {
+                ctx.server.cursor.store(sub_id, wal_offset);
+            }
+            std.log.debug("broker: ACK sub={s} wal_offset={d}", .{ sub_id, wal_offset });
         } else {
-            // Drain unknown frame body (minus the byte already consumed).
             const skip_len: usize = if (body_len > 1) body_len - 1 else 0;
             const skip = alloc.alloc(u8, skip_len) catch break;
             defer alloc.free(skip);

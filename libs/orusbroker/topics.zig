@@ -55,11 +55,14 @@ pub const TopicRouter = struct {
     }
 
     // Deliver `payload` (pre-serialized InternalMessage) to every alive
-    // subscriber whose topic matches. Write failures mark the sub dead.
+    // subscriber whose topic matches. `wal_offset` is the byte offset immediately
+    // after this WAL entry — the subscriber echoes it back in ACK and persists it
+    // as its cursor. Write failures mark the sub dead.
     // `payload` must be valid for the duration of this call.
-    pub fn deliver(self: *TopicRouter, topic: []const u8, payload: []const u8) void {
+    pub fn deliver(self: *TopicRouter, topic: []const u8, payload: []const u8, wal_offset: u64) void {
         const topic_len: u16 = @intCast(topic.len);
-        const body_len:  u32 = @intCast(1 + 2 + topic.len + payload.len);
+        // body = frame_type(1) + topic_len(2) + topic + wal_offset(8) + payload
+        const body_len:  u32 = @intCast(1 + 2 + topic.len + 8 + payload.len);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -76,6 +79,7 @@ pub const TopicRouter = struct {
                 w.writeByte(proto.FRAME_DELIVER)         catch break :blk false;
                 w.writeInt(u16, topic_len,           .big) catch break :blk false;
                 w.writeAll(topic)                        catch break :blk false;
+                w.writeInt(u64, wal_offset,          .big) catch break :blk false;
                 w.writeAll(payload)                      catch break :blk false;
                 w.flush()                                catch break :blk false;
                 break :blk true;
