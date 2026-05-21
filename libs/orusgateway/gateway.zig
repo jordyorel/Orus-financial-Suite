@@ -12,9 +12,10 @@ pub const GatewayError = translator.TranslateError || BankClientError;
 
 pub const Gateway = struct {
     bank: BankClient,
+    pan_hash_seed: u64,
 
-    pub fn init(bank: BankClient) Gateway {
-        return .{ .bank = bank };
+    pub fn init(bank: BankClient, pan_hash_seed: u64) Gateway {
+        return .{ .bank = bank, .pan_hash_seed = pan_hash_seed };
     }
 
     // Full pipeline: InternalMessage → ISO 8583 request → bank → ISO 8583 response → InternalMessage.
@@ -40,7 +41,7 @@ pub const Gateway = struct {
         base.hop_count +|= 1; // saturating: never wraps past 255
         base.received_at = @intCast(std.Io.Clock.real.now(self.bank.io).nanoseconds);
 
-        return translator.toInternal(&iso_resp, base, alloc);
+        return translator.toInternal(&iso_resp, base, alloc, self.pan_hash_seed);
     }
 };
 
@@ -116,7 +117,7 @@ test "Gateway.process: approved 0210 response" {
     const gw = Gateway.init(BankClient.init(.{
         .host = "127.0.0.1",
         .port = TEST_PORT,
-    }, io));
+    }, io), 0);
 
     var adapter_fields = [_]InternalMessage.FieldEntry{
         .{ .id = 3, .value = "300000" },
@@ -181,7 +182,7 @@ test "Gateway.process: declined 0210 response" {
     const gw = Gateway.init(BankClient.init(.{
         .host = "127.0.0.1",
         .port = TEST_PORT + 1,
-    }, io));
+    }, io), 0);
 
     const req = InternalMessage{
         .msg_id = [_]u8{0xBB} ** 16,

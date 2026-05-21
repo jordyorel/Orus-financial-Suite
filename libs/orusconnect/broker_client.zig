@@ -15,11 +15,11 @@ pub const Config = struct {
 //
 // Client → Broker:
 //   PUBLISH   (0x01): [u16 topic_len][topic][serialized InternalMessage]
-//   SUBSCRIBE (0x02): [u16 topic_len][topic]
-//   ACK       (0x04): [16]msg_id
+//   SUBSCRIBE (0x02): [u16 topic_len][topic][u16 sub_id_len][sub_id]
+//   ACK       (0x04): [u64 wal_offset BE]
 //
 // Broker → Client:
-//   DELIVER   (0x03): [u16 topic_len][topic][serialized InternalMessage]
+//   DELIVER     (0x03): [u16 topic_len][topic][u64 wal_offset BE][serialized InternalMessage]
 //   PUBLISH_ACK (0x06): single byte (no body_len prefix — legacy)
 const FRAME_PUBLISH: u8 = 0x01;
 const FRAME_SUBSCRIBE: u8 = 0x02;
@@ -94,12 +94,13 @@ pub const BrokerClient = struct {
         var write_buf: [256]u8 = undefined;
         var sw = stream.writer(self.io, &write_buf);
 
-        // SUBSCRIBE frame
-        const sub_len: u32 = @intCast(1 + 2 + topic.len);
+        // SUBSCRIBE frame — anonymous (sub_id_len = 0, no cursor replay)
+        const sub_len: u32 = @intCast(1 + 2 + topic.len + 2);
         sw.interface.writeInt(u32, sub_len, .big) catch return error.BrokerUnavailable;
         sw.interface.writeByte(FRAME_SUBSCRIBE) catch return error.BrokerUnavailable;
         sw.interface.writeInt(u16, @intCast(topic.len), .big) catch return error.BrokerUnavailable;
         sw.interface.writeAll(topic) catch return error.BrokerUnavailable;
+        sw.interface.writeInt(u16, 0, .big) catch return error.BrokerUnavailable; // sub_id_len = 0
         sw.interface.flush() catch return error.BrokerUnavailable;
 
         var read_buf: [16384]u8 = undefined;
@@ -121,7 +122,7 @@ pub const BrokerClient = struct {
                 continue;
             }
 
-            // Parse DELIVER body: [u16 topic_len][topic][serialized InternalMessage]
+            // Parse DELIVER body: [u16 topic_len][topic][u64 wal_offset][serialized InternalMessage]
             var tl_bytes: [2]u8 = undefined;
             sr.interface.readSliceAll(&tl_bytes) catch return error.BrokerUnavailable;
             const topic_len_val = std.mem.readInt(u16, &tl_bytes, .big);
@@ -130,7 +131,13 @@ pub const BrokerClient = struct {
             defer alloc.free(topic_buf);
             sr.interface.readSliceAll(topic_buf) catch return error.BrokerUnavailable;
 
-            const payload_len: usize = body_len -| (1 + 2 + topic_len_val);
+            var offset_bytes: [8]u8 = undefined;
+            sr.interface.readSliceAll(&offset_bytes) catch return error.BrokerUnavailable;
+            const wal_offset = std.mem.readInt(u64, &offset_bytes, .big);
+
+            const hdr: u32 = 1 + 2 + topic_len_val + 8;
+            if (body_len < hdr) return error.BrokerUnavailable;
+            const payload_len: usize = body_len - hdr;
             const payload = alloc.alloc(u8, payload_len) catch return error.BrokerUnavailable;
             defer alloc.free(payload);
             sr.interface.readSliceAll(payload) catch return error.BrokerUnavailable;
@@ -141,10 +148,10 @@ pub const BrokerClient = struct {
 
             callback(&msg, ctx);
 
-            // ACK frame: body = [0x04][msg_id 16 bytes], body_len = 17
-            sw.interface.writeInt(u32, 17, .big) catch return error.BrokerUnavailable;
+            // ACK frame: body = [u8 0x04][u64 wal_offset BE], body_len = 9
+            sw.interface.writeInt(u32, 9, .big) catch return error.BrokerUnavailable;
             sw.interface.writeByte(FRAME_ACK) catch return error.BrokerUnavailable;
-            sw.interface.writeAll(&msg.msg_id) catch return error.BrokerUnavailable;
+            sw.interface.writeInt(u64, wal_offset, .big) catch return error.BrokerUnavailable;
             sw.interface.flush() catch return error.BrokerUnavailable;
         }
     }

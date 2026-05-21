@@ -44,33 +44,72 @@ fn healthFn(ctx: *anyopaque, req: *http.HttpRequest, alloc: std.mem.Allocator) h
 
 // ── Direction 2: broker → MoMo dispatch ──────────────────────────────────────
 
+// MSISDN prefix → provider routing (Congo-Brazzaville +242).
+// Field 2 carries the full MSISDN (e.g. "242065001234").
+// Extend this table when adding new countries or operators.
+const MsisdnPrefix = struct {
+    prefix: []const u8,
+    provider: orusshare.ServiceProvider,
+};
+const MSISDN_PREFIXES = [_]MsisdnPrefix{
+    .{ .prefix = "24206", .provider = .mtn_momo    }, // MTN Congo (+242 06)
+    .{ .prefix = "24205", .provider = .airtel_money }, // Airtel Congo (+242 05)
+};
+
+fn providerFromMsisdn(msisdn: []const u8) ?orusshare.ServiceProvider {
+    for (MSISDN_PREFIXES) |entry| {
+        if (std.mem.startsWith(u8, msisdn, entry.prefix)) return entry.provider;
+    }
+    return null;
+}
+
+fn findField(fields: []const orusshare.InternalMessage.FieldEntry, id: u8) ?[]const u8 {
+    for (fields) |f| if (f.id == id) return f.value;
+    return null;
+}
+
 const DispatchCtx = struct {
-    mtn:        *const mtn_mod.MtnMomoAdapter,
-    airtel:     *const airtel_mod.AirtelMoneyAdapter,
-    mtn_client: ApiClient,
+    mtn:          *const mtn_mod.MtnMomoAdapter,
+    airtel:       *const airtel_mod.AirtelMoneyAdapter,
+    mtn_client:   ApiClient,
     airtel_client: ApiClient,
-    alloc:      std.mem.Allocator,
+    alloc:        std.mem.Allocator,
 };
 
 fn onDispatch(msg: *const orusshare.InternalMessage, raw_ctx: ?*anyopaque) void {
     const ctx: *DispatchCtx = @ptrCast(@alignCast(raw_ctx.?));
-    switch (msg.provider) {
+
+    // Resolve provider: trust msg.provider when set, else derive from MSISDN (field 2).
+    const provider: orusshare.ServiceProvider = if (msg.provider != .none)
+        msg.provider
+    else blk: {
+        const msisdn = findField(msg.fields, 2) orelse {
+            std.log.warn("dispatch: no provider and no MSISDN (field 2) for msg_id={s}", .{
+                std.fmt.bytesToHex(msg.msg_id, .lower),
+            });
+            return;
+        };
+        break :blk providerFromMsisdn(msisdn) orelse {
+            std.log.warn("dispatch: unknown MSISDN prefix '{s}' for msg_id={s}", .{
+                msisdn, std.fmt.bytesToHex(msg.msg_id, .lower),
+            });
+            return;
+        };
+    };
+
+    switch (provider) {
         .mtn_momo => {
-            const result = mtn_mod.dispatch(ctx.mtn, msg, &ctx.mtn_client, ctx.alloc) catch |err| {
-                std.log.warn("dispatch: MTN dispatch failed: {}", .{err});
-                return;
+            _ = mtn_mod.dispatch(ctx.mtn, msg, &ctx.mtn_client, ctx.alloc) catch |err| {
+                std.log.warn("dispatch: MTN failed: {}", .{err});
             };
-            _ = result;
         },
         .airtel_money => {
-            const result = airtel_mod.dispatch(ctx.airtel, msg, &ctx.airtel_client, ctx.alloc) catch |err| {
-                std.log.warn("dispatch: Airtel dispatch failed: {}", .{err});
-                return;
+            _ = airtel_mod.dispatch(ctx.airtel, msg, &ctx.airtel_client, ctx.alloc) catch |err| {
+                std.log.warn("dispatch: Airtel failed: {}", .{err});
             };
-            _ = result;
         },
         else => {
-            std.log.warn("dispatch: unknown provider for msg_id={s}", .{std.fmt.bytesToHex(msg.msg_id, .lower)});
+            std.log.warn("dispatch: provider {s} not handled", .{@tagName(provider)});
         },
     }
 }
@@ -84,7 +123,7 @@ const ConsumeArgs = struct {
 fn consumeLoop(args: *ConsumeArgs) void {
     while (true) {
         args.broker.consume(
-            "transactions.financial",
+            "transactions.outbound",
             args.alloc,
             onDispatch,
             args.ctx,
@@ -106,6 +145,11 @@ fn getenv(name: [:0]const u8) ?[]const u8 {
 fn envU16(name: [:0]const u8, default: u16) u16 {
     const s = getenv(name) orelse return default;
     return std.fmt.parseInt(u16, s, 10) catch default;
+}
+
+fn envU64(name: [:0]const u8, default: u64) u64 {
+    const s = getenv(name) orelse return default;
+    return std.fmt.parseInt(u64, s, 10) catch default;
 }
 
 fn require(name: [:0]const u8) []const u8 {
@@ -149,12 +193,15 @@ pub fn main() !void {
     }, io);
 
     // Adapters
+    const pan_seed = envU64("PAN_HASH_SEED", 0);
+
     var mtn = mtn_mod.MtnMomoAdapter.init(
         mtn_schema,
         require("MTN_BEARER_TOKEN"),
         require("MTN_CALLBACK_TOKEN"),
         &tx_store,
         &broker,
+        pan_seed,
     );
 
     var airtel = airtel_mod.AirtelMoneyAdapter.init(
@@ -162,6 +209,7 @@ pub fn main() !void {
         require("AIRTEL_BEARER_TOKEN"),
         &tx_store,
         &broker,
+        pan_seed,
     );
 
     // Direction 2: consume loop (broker → MoMo dispatch)

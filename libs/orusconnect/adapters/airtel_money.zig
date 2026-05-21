@@ -15,18 +15,21 @@ pub const AirtelMoneyAdapter = struct {
     token_validator: oauth2.TokenValidator,
     pending_tx: *pending.PendingTxStore,
     broker: *const broker_mod.BrokerClient,
+    pan_hash_seed: u64,
 
     pub fn init(
         schema: toml.AdapterSchema,
         bearer_token: []const u8,
         pending_tx: *pending.PendingTxStore,
         broker: *const broker_mod.BrokerClient,
+        pan_hash_seed: u64,
     ) AirtelMoneyAdapter {
         return .{
             .schema = schema,
             .token_validator = .{ .token = bearer_token },
             .pending_tx = pending_tx,
             .broker = broker,
+            .pan_hash_seed = pan_hash_seed,
         };
     }
 
@@ -149,13 +152,13 @@ pub const AirtelMoneyAdapter = struct {
         return .{
             .msg_id = msg_id,
             .schema_id = self.schema.id,
-            .topic = "transactions.financial",
+            .topic = "transactions.inbound",
             .origin = .rest_json,
             .provider = .airtel_money,
             .mti = self.schema.mti_debit,
             .fields = @constCast(AIRTEL_FIELDS[0..]),
             .stan = randomStan(),
-            .pan_hash = orusshare.hash.hashPan(msisdn),
+            .pan_hash = orusshare.hash.hashPan(msisdn, self.pan_hash_seed),
             .amount = amount,
             .currency = currency[0..3].*,
             .received_at = now_ns,
@@ -176,7 +179,7 @@ pub const DispatchError = error{
 pub fn dispatch(
     self: *const AirtelMoneyAdapter,
     msg: *const orusshare.InternalMessage,
-    client: *const api_client.ApiClient,
+    client: *api_client.ApiClient,
     alloc: std.mem.Allocator,
 ) DispatchError!orusshare.InternalMessage {
     const msisdn = findField(msg.fields, 2) orelse return error.MissingMsisdn;
@@ -191,9 +194,11 @@ pub fn dispatch(
         if (msg.external_id) |e| e else &msg.stan,
     }) catch return error.OutOfMemory;
 
+    var bearer_buf: [280]u8 = undefined;
+    const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{self.token_validator.token}) catch return error.OutOfMemory;
     const hdrs = [_]api_client.Header{
         .{ .name = "Content-Type", .value = "application/json" },
-        .{ .name = "Authorization", .value = bearerToken(self.token_validator.token) },
+        .{ .name = "Authorization", .value = bearer },
     };
 
     var resp = client.post(
@@ -256,15 +261,6 @@ fn airtelResponseCode(status: u16, body: []const u8) []const u8 {
     return "96";
 }
 
-var bearer_buf: [280]u8 = undefined;
-fn bearerToken(token: []const u8) []const u8 {
-    const prefix = "Bearer ";
-    @memcpy(bearer_buf[0..prefix.len], prefix);
-    const end = prefix.len + token.len;
-    @memcpy(bearer_buf[prefix.len..end], token);
-    return bearer_buf[0..end];
-}
-
 fn strField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return switch (obj.get(key) orelse return null) {
         .string => |s| s,
@@ -295,7 +291,7 @@ test "AirtelMoneyAdapter: unauthorized without token" {
     defer schema.deinit();
 
     const dummy_broker = broker_mod.BrokerClient.init(.{ .host = "127.0.0.1", .port = 1 }, undefined);
-    const adapter = AirtelMoneyAdapter.init(schema, "secret", &store, &dummy_broker);
+    const adapter = AirtelMoneyAdapter.init(schema, "secret", &store, &dummy_broker, 0);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -324,7 +320,7 @@ test "AirtelMoneyAdapter: bad request on missing msisdn" {
     defer schema.deinit();
 
     const dummy_broker = broker_mod.BrokerClient.init(.{ .host = "127.0.0.1", .port = 1 }, undefined);
-    const adapter = AirtelMoneyAdapter.init(schema, "tok", &store, &dummy_broker);
+    const adapter = AirtelMoneyAdapter.init(schema, "tok", &store, &dummy_broker, 0);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -366,7 +362,7 @@ test "AirtelMoneyAdapter: callback updates state" {
     defer schema.deinit();
 
     const dummy_broker = broker_mod.BrokerClient.init(.{ .host = "127.0.0.1", .port = 1 }, undefined);
-    const adapter = AirtelMoneyAdapter.init(schema, "tok", &store, &dummy_broker);
+    const adapter = AirtelMoneyAdapter.init(schema, "tok", &store, &dummy_broker, 0);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

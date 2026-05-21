@@ -68,7 +68,7 @@ pub const ApiClient = struct {
     }
 
     pub fn post(
-        self: *const ApiClient,
+        self: *ApiClient,
         path: []const u8,
         headers: []const Header,
         body: []const u8,

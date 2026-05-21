@@ -108,7 +108,9 @@ fn handlePublish(ctx: *ConnCtx, r: *std.Io.Reader, remaining: u32) void {
     defer alloc.free(topic);
     r.readSliceAll(topic) catch return;
 
-    const payload_len: usize = remaining -| (2 + topic_len);
+    const hdr: u32 = 2 + topic_len;
+    if (remaining < hdr) return;
+    const payload_len: usize = remaining - hdr;
     const payload = alloc.alloc(u8, payload_len) catch return;
     defer alloc.free(payload);
     r.readSliceAll(payload) catch return;

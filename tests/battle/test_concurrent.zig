@@ -13,7 +13,7 @@ const TopicRouter  = orusbroker.TopicRouter;
 const Wal          = orusbroker.Wal;
 const proto        = orusbroker.protocol;
 
-const PORT_CONCURRENT: u16 = 17_780;
+const PORT_CONCURRENT: u16 = 17_800;
 const THREADS:  usize = 20;
 const MESSAGES: usize = 50; // 20 × 50 = 1000 messages
 

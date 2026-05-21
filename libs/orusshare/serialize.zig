@@ -91,6 +91,7 @@ pub fn deserialize(r: *std.Io.Reader, alloc: std.mem.Allocator) (std.Io.Reader.E
 
     const topic_len = try r.takeInt(u16, .big);
     const topic = try alloc.alloc(u8, topic_len);
+    errdefer alloc.free(topic);
     try r.readSliceAll(topic);
     msg.topic = topic;
 
@@ -123,6 +124,7 @@ pub fn deserialize(r: *std.Io.Reader, alloc: std.mem.Allocator) (std.Io.Reader.E
     const eid_len = try r.takeInt(u16, .big);
     if (eid_len > 0) {
         const eid = try alloc.alloc(u8, eid_len);
+        errdefer alloc.free(eid);
         try r.readSliceAll(eid);
         msg.external_id = eid;
     } else {
@@ -131,6 +133,9 @@ pub fn deserialize(r: *std.Io.Reader, alloc: std.mem.Allocator) (std.Io.Reader.E
 
     const field_count = try r.takeInt(u16, .big);
     const fields = try alloc.alloc(InternalMessage.FieldEntry, field_count);
+    errdefer alloc.free(fields);
+    var fields_done: usize = 0;
+    errdefer for (fields[0..fields_done]) |f| alloc.free(f.value);
     for (fields) |*field| {
         field.id = try r.takeByte();
         const val_len = try r.takeInt(u16, .big);
@@ -138,6 +143,7 @@ pub fn deserialize(r: *std.Io.Reader, alloc: std.mem.Allocator) (std.Io.Reader.E
         errdefer alloc.free(val);
         try r.readSliceAll(val);
         field.value = val;
+        fields_done += 1;
     }
     msg.fields = fields;
 

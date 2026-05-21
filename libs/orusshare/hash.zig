@@ -1,10 +1,10 @@
 const std = @import("std");
 const message = @import("message.zig");
 
-// Fast u64 hash of PAN for broker partition routing.
-// Uses Wyhash — non-cryptographic, collision-resistant enough for partitioning.
-pub fn hashPan(pan: []const u8) u64 {
-    return std.hash.Wyhash.hash(0, pan);
+// Keyed u64 hash of PAN. seed must be a secret loaded at startup (PCI-DSS Req 3.5).
+// Using seed=0 is acceptable only in tests or for pure routing (no WAL persistence).
+pub fn hashPan(pan: []const u8, seed: u64) u64 {
+    return std.hash.Wyhash.hash(seed, pan);
 }
 
 // PCI-DSS Req 3.4 — mask a PAN for safe display in logs and audit trails.
@@ -56,14 +56,14 @@ test "maskPan: does not contain raw middle digits" {
 }
 
 test "hashPan: same PAN same hash" {
-    const h1 = hashPan("4762000000001234");
-    const h2 = hashPan("4762000000001234");
+    const h1 = hashPan("4762000000001234", 0);
+    const h2 = hashPan("4762000000001234", 0);
     try std.testing.expectEqual(h1, h2);
 }
 
 test "hashPan: different PAN different hash" {
-    const h1 = hashPan("4762000000001234");
-    const h2 = hashPan("4762000000005678");
+    const h1 = hashPan("4762000000001234", 0);
+    const h2 = hashPan("4762000000005678", 0);
     try std.testing.expect(h1 != h2);
 }
 

@@ -16,6 +16,7 @@ pub const MtnMomoAdapter = struct {
     callback_token: []const u8,
     pending_tx: *pending.PendingTxStore,
     broker: *const broker_mod.BrokerClient,
+    pan_hash_seed: u64,
 
     pub fn init(
         schema: toml.AdapterSchema,
@@ -23,6 +24,7 @@ pub const MtnMomoAdapter = struct {
         callback_token: []const u8,
         pending_tx: *pending.PendingTxStore,
         broker: *const broker_mod.BrokerClient,
+        pan_hash_seed: u64,
     ) MtnMomoAdapter {
         return .{
             .schema = schema,
@@ -30,6 +32,7 @@ pub const MtnMomoAdapter = struct {
             .callback_token = callback_token,
             .pending_tx = pending_tx,
             .broker = broker,
+            .pan_hash_seed = pan_hash_seed,
         };
     }
 
@@ -156,13 +159,13 @@ pub const MtnMomoAdapter = struct {
         return .{
             .msg_id = msg_id,
             .schema_id = self.schema.id,
-            .topic = "transactions.financial",
+            .topic = "transactions.inbound",
             .origin = .rest_json,
             .provider = .mtn_momo,
             .mti = self.schema.mti_debit,
             .fields = @constCast(MTN_FIELDS[0..]),
             .stan = randomStan(),
-            .pan_hash = orusshare.hash.hashPan(msisdn),
+            .pan_hash = orusshare.hash.hashPan(msisdn, self.pan_hash_seed),
             .amount = amount,
             .currency = currency[0..3].*,
             .received_at = now_ns,
@@ -187,7 +190,7 @@ pub const DispatchError = error{
 pub fn dispatch(
     self: *const MtnMomoAdapter,
     msg: *const orusshare.InternalMessage,
-    client: *const api_client.ApiClient,
+    client: *api_client.ApiClient,
     alloc: std.mem.Allocator,
 ) DispatchError!orusshare.InternalMessage {
     // Field 2 carries the destination MSISDN when the bank initiates a transfer.
@@ -204,9 +207,11 @@ pub fn dispatch(
         if (msg.external_id) |e| e else &msg.stan,
     }) catch return error.OutOfMemory;
 
+    var bearer_buf: [280]u8 = undefined;
+    const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{self.token_validator.token}) catch return error.OutOfMemory;
     const hdrs = [_]api_client.Header{
         .{ .name = "Content-Type", .value = "application/json" },
-        .{ .name = "Authorization", .value = bearerToken(self.token_validator.token) },
+        .{ .name = "Authorization", .value = bearer },
     };
 
     var resp = client.post(
@@ -257,17 +262,6 @@ fn mtnResponseCode(status: u16, body: []const u8) []const u8 {
     if (status == 409) return "94"; // duplicate
     if (status == 404) return "15"; // account not found
     return "96"; // generic error
-}
-
-// Build "Bearer <token>" header value in a static buffer.
-// MTN tokens are at most 256 bytes in practice.
-var bearer_buf: [280]u8 = undefined;
-fn bearerToken(token: []const u8) []const u8 {
-    const prefix = "Bearer ";
-    @memcpy(bearer_buf[0..prefix.len], prefix);
-    const end = prefix.len + token.len;
-    @memcpy(bearer_buf[prefix.len..end], token);
-    return bearer_buf[0..end];
 }
 
 fn randomStan() [6]u8 {
@@ -332,7 +326,7 @@ test "MtnMomoAdapter: unauthorized without token" {
         .port = 1,
     }, undefined);
 
-    const adapter = MtnMomoAdapter.init(schema, "secret", "cb_token", &store, &dummy_broker);
+    const adapter = MtnMomoAdapter.init(schema, "secret", "cb_token", &store, &dummy_broker, 0);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -370,7 +364,7 @@ test "MtnMomoAdapter: bad request on missing msisdn" {
         .port = 1,
     }, undefined);
 
-    const adapter = MtnMomoAdapter.init(schema, "tok", "cb", &store, &dummy_broker);
+    const adapter = MtnMomoAdapter.init(schema, "tok", "cb", &store, &dummy_broker, 0);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -413,7 +407,7 @@ test "MtnMomoAdapter: callback updates state" {
     defer schema.deinit();
 
     const dummy_broker = broker_mod.BrokerClient.init(.{ .host = "127.0.0.1", .port = 1 }, undefined);
-    const adapter = MtnMomoAdapter.init(schema, "tok", "cb_secret", &store, &dummy_broker);
+    const adapter = MtnMomoAdapter.init(schema, "tok", "cb_secret", &store, &dummy_broker, 0);
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

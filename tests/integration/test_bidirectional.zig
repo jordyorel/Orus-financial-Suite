@@ -37,7 +37,7 @@ fn makeMsg(alloc: std.mem.Allocator, topic: []const u8, amount: i64) !InternalMe
         .mti         = "0200".*,
         .fields      = fields,
         .stan        = [_]u8{0} ** 6,
-        .pan_hash    = orusshare.hash.hashPan("4762001234567890"),
+        .pan_hash    = orusshare.hash.hashPan("4762001234567890", 0),
         .amount      = amount,
         .currency    = "XAF".*,
         .received_at = 0,
@@ -150,7 +150,7 @@ test "Direction 2: ISO 8583 0200 → toInternal préserve amount et currency" {
         .external_id = null,
     };
 
-    const im = try toInternal(&bank_msg, base, alloc);
+    const im = try toInternal(&bank_msg, base, alloc, 0);
     defer {
         for (im.fields) |f| alloc.free(f.value);
         alloc.free(im.fields);
@@ -195,7 +195,7 @@ test "Direction 2: ISO 8583 → toInternal → serialize/deserialize round-trip"
         .external_id = null,
     };
 
-    const im = try toInternal(&bank_msg, base, alloc);
+    const im = try toInternal(&bank_msg, base, alloc, 0);
     defer {
         for (im.fields) |f| alloc.free(f.value);
         alloc.free(im.fields);
@@ -249,7 +249,7 @@ test "Direction 2: InternalMessage conserve le hop_count en passant par Gateway"
         .external_id = null,
     };
 
-    const im = try toInternal(&bank_msg, base, alloc);
+    const im = try toInternal(&bank_msg, base, alloc, 0);
     defer {
         for (im.fields) |f| alloc.free(f.value);
         alloc.free(im.fields);
@@ -283,13 +283,13 @@ test "PAN masking: le PAN brut n'apparaît pas dans la sérialisation InternalMe
 
 test "PAN masking: pan_hash différent selon le PAN" {
     // hash.hashPan produit deux valeurs distinctes pour deux PANs différents.
-    const h1 = orusshare.hash.hashPan("4762001234567890");
-    const h2 = orusshare.hash.hashPan("5500001111222233");
+    const h1 = orusshare.hash.hashPan("4762001234567890", 0);
+    const h2 = orusshare.hash.hashPan("5500001111222233", 0);
     try testing.expect(h1 != h2);
 }
 
 test "PAN masking: même PAN → même hash (déterministe)" {
-    const h1 = orusshare.hash.hashPan("4762001234567890");
-    const h2 = orusshare.hash.hashPan("4762001234567890");
+    const h1 = orusshare.hash.hashPan("4762001234567890", 0);
+    const h2 = orusshare.hash.hashPan("4762001234567890", 0);
     try testing.expectEqual(h1, h2);
 }

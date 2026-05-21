@@ -48,6 +48,11 @@ fn envU16(name: [:0]const u8, default: u16) u16 {
     return std.fmt.parseInt(u16, s, 10) catch default;
 }
 
+fn envU64(name: [:0]const u8, default: u64) u64 {
+    const s = getenv(name) orelse return default;
+    return std.fmt.parseInt(u64, s, 10) catch default;
+}
+
 fn loadConfig(alloc: std.mem.Allocator) !Config {
     const listen_host = if (getenv("GATEWAY_LISTEN_HOST")) |s|
         try alloc.dupe(u8, s)
@@ -194,6 +199,49 @@ fn resolveIsoSchema(name: []const u8, alloc: std.mem.Allocator) !schema_mod.IsoS
     return parseIsoSchema(src, alloc);
 }
 
+// ── Direction 1: OrusBroker → Gateway → Bank ─────────────────────────────────
+
+const D1Args = struct {
+    gateway: *const Gateway,
+    broker:  GatewayBrokerClient,
+    alloc:   std.mem.Allocator,
+};
+
+fn onD1Message(raw_msg: *const orusshare.InternalMessage, raw_ctx: ?*anyopaque) void {
+    const args: *const D1Args = @ptrCast(@alignCast(raw_ctx.?));
+
+    // Avoid infinite loop: skip messages that already came from the bank leg.
+    if (raw_msg.origin == .iso8583) return;
+
+    const resp = args.gateway.process(raw_msg, args.alloc) catch |err| {
+        std.log.err("D1 gateway.process failed: {}", .{err});
+        return;
+    };
+    defer {
+        for (resp.fields) |f| args.alloc.free(f.value);
+        args.alloc.free(resp.fields);
+    }
+
+    args.broker.publish(&resp, args.alloc) catch |err| {
+        std.log.err("D1 broker.publish failed: {}", .{err});
+    };
+}
+
+// Reconnect loop — runs in a dedicated thread.
+fn d1ConsumeLoop(args: *D1Args) void {
+    while (true) {
+        args.broker.consume(
+            "transactions.inbound",
+            args.alloc,
+            onD1Message,
+            @ptrCast(@constCast(args)),
+        ) catch {};
+        // Brief pause before reconnect so we don't spin on a dead broker.
+        const ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+        _ = std.c.nanosleep(&ts, null);
+    }
+}
+
 const BankServerArgs = struct {
     server: *const BankServer,
     alloc: std.mem.Allocator,
@@ -225,7 +273,7 @@ pub fn main() !void {
         .host = config.bank_host,
         .port = config.bank_port,
         .length_prefix = config.bank_prefix,
-    }, io));
+    }, io), envU64("PAN_HASH_SEED", 0));
 
     // ── Direction 2: ISO 8583 listener (bank/switch connects to us) ─────────
     var iso_schema = try resolveIsoSchema(config.iso_schema_name, alloc);
@@ -245,6 +293,19 @@ pub fn main() !void {
     var bs_args = BankServerArgs{ .server = &bank_srv, .alloc = alloc };
     const bs_thread = try std.Thread.spawn(.{}, runBankServer, .{&bs_args});
     bs_thread.detach();
+
+    // D1 subscriber: OrusBroker → Gateway → Bank → OrusBroker (response topic).
+    // Uses page_allocator so the thread doesn't share the main GPA.
+    var d1_args = D1Args{
+        .gateway = &gw,
+        .broker  = GatewayBrokerClient.init(.{
+            .host = config.broker_host,
+            .port = config.broker_port,
+        }, io),
+        .alloc = std.heap.page_allocator,
+    };
+    const d1_thread = try std.Thread.spawn(.{}, d1ConsumeLoop, .{&d1_args});
+    d1_thread.detach();
 
     const addr = try std.Io.net.IpAddress.parse(config.listen_host, config.listen_port);
     var server = try addr.listen(io, .{ .reuse_address = true });

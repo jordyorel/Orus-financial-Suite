@@ -17,6 +17,7 @@ pub const Cursor = struct {
 
     // Returns 0 if the cursor file does not exist or cannot be read.
     pub fn load(self: *const Cursor, sub_id: []const u8) u64 {
+        std.debug.assert(proto.isValidSubId(sub_id));
         var path_buf: [proto.MAX_SUB_ID_LEN + 300]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.cursor", .{ self.dir, sub_id }) catch return 0;
         const file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch return 0;
@@ -30,6 +31,7 @@ pub const Cursor = struct {
     // Writes the cursor atomically (create + truncate).
     // Silently ignores all errors to avoid disrupting the ACK loop.
     pub fn store(self: *const Cursor, sub_id: []const u8, offset: u64) void {
+        std.debug.assert(proto.isValidSubId(sub_id));
         var path_buf: [proto.MAX_SUB_ID_LEN + 300]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.cursor", .{ self.dir, sub_id }) catch return;
         std.Io.Dir.cwd().createDirPath(self.io, self.dir) catch {};

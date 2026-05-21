@@ -6,9 +6,9 @@ pub const ApiKeyValidator = struct {
     header_name: []const u8 = "x-api-key",
 
     pub fn validate(self: *const ApiKeyValidator, provided: []const u8) bool {
-        if (provided.len != self.key.len) return false;
-        var diff: u8 = 0;
-        for (provided, self.key) |a, b| diff |= a ^ b;
+        const n = @min(provided.len, self.key.len);
+        var diff: u8 = @intFromBool(provided.len != self.key.len);
+        for (provided[0..n], self.key[0..n]) |a, b| diff |= a ^ b;
         return diff == 0;
     }
 };

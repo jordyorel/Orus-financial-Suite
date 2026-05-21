@@ -35,7 +35,9 @@
       "Bash(./.zig-cache/o/cc5cb0d3abcdf52860dd80360bbc5308/test)",
       "Bash(echo \"battle exit: $?\")",
       "Bash(./.zig-cache/o/fe7337ff4aab0aa0cf0aad635d12077a/test)",
-      "Bash(echo \"broker exit: $?\")"
+      "Bash(echo \"broker exit: $?\")",
+      "Bash(grep -i \"init\\\\|{$\")",
+      "Bash(lsof -iTCP -sTCP:LISTEN -n)"
     ]
   }
 }

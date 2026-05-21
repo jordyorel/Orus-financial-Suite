@@ -25,7 +25,7 @@ pub const Config = struct {
     port: u16,
     length_prefix: bank_client_mod.LengthPrefix = .two_byte_be,
     // OrusBroker topic to publish received transactions on.
-    topic: []const u8 = "transactions.financial",
+    topic: []const u8 = "transactions.outbound",
 };
 
 pub const BankServer = struct {
@@ -33,6 +33,7 @@ pub const BankServer = struct {
     io: std.Io,
     schema: *const schema_mod.IsoSchema,
     broker: broker_mod.BrokerClient,
+    pan_hash_seed: u64 = 0,
 
     pub fn init(
         config: Config,
@@ -137,7 +138,7 @@ fn handleConn(ctx: *ConnCtx) void {
         .external_id = null,
     };
 
-    const im = translator.toInternal(&iso_msg, base, alloc) catch |err| {
+    const im = translator.toInternal(&iso_msg, base, alloc, ctx.server.pan_hash_seed) catch |err| {
         std.log.warn("bank_server: toInternal failed: {}", .{err});
         return;
     };

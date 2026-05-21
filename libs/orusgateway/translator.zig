@@ -52,6 +52,7 @@ pub fn toInternal(
     iso: *const IsoMessage,
     base: InternalMessage,
     alloc: std.mem.Allocator,
+    pan_hash_seed: u64,
 ) TranslateError!InternalMessage {
     var msg = base;
     msg.mti = iso.mti;
@@ -79,7 +80,7 @@ pub fn toInternal(
         const val = iso.get(@intCast(n)) orelse continue;
         if (n == 2) {
             // Field 2 (PAN) — hash into pan_hash, never store raw (CDC §6, PCI-DSS Req 3.4).
-            msg.pan_hash = orusshare.hash.hashPan(val);
+            msg.pan_hash = orusshare.hash.hashPan(val, pan_hash_seed);
             continue;
         }
         const duped = try alloc.dupe(u8, val);
@@ -184,7 +185,7 @@ test "toInternal: ISO fields populate InternalMessage" {
         .external_id = null,
     };
 
-    const result = try toInternal(&iso, base, alloc);
+    const result = try toInternal(&iso, base, alloc, 0);
     defer {
         for (result.fields) |f| alloc.free(f.value);
         alloc.free(result.fields);
@@ -225,7 +226,7 @@ test "round-trip: fromInternal then toInternal" {
     var iso = try fromInternal(&original, alloc);
     defer iso.deinit();
 
-    const restored = try toInternal(&iso, original, alloc);
+    const restored = try toInternal(&iso, original, alloc, 0);
     defer {
         for (restored.fields) |f| alloc.free(f.value);
         alloc.free(restored.fields);

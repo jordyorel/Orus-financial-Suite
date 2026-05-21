@@ -9,9 +9,9 @@ pub const TokenValidator = struct {
         const prefix = "Bearer ";
         if (!std.mem.startsWith(u8, auth_header, prefix)) return false;
         const provided = auth_header[prefix.len..];
-        if (provided.len != self.token.len) return false;
-        var diff: u8 = 0;
-        for (provided, self.token) |a, b| diff |= a ^ b;
+        const n = @min(provided.len, self.token.len);
+        var diff: u8 = @intFromBool(provided.len != self.token.len);
+        for (provided[0..n], self.token[0..n]) |a, b| diff |= a ^ b;
         return diff == 0;
     }
 };
