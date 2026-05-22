@@ -69,10 +69,11 @@ const PubArgs = struct {
 };
 
 fn publishLoop(args: PubArgs) void {
-    const client = orusconnect.BrokerClient.init(
+    var publisher = orusconnect.Publisher.init(
         .{ .host = "127.0.0.1", .port = BROKER_PORT },
         args.io,
     );
+    defer publisher.deinit();
 
     var ts_init: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts_init);
@@ -105,13 +106,13 @@ fn publishLoop(args: PubArgs) void {
             .pan_hash    = prng_state,
             .amount      = if (declined) -amount else amount,
             .currency    = "XAF".*,
-            .received_at = now_ns, // horodatage pour la mesure de latence
+            .received_at = now_ns,
             .source_ip   = [_]u8{0} ** 16,
             .hop_count   = 1,
             .external_id = null,
         };
 
-        client.publish(&msg) catch {
+        publisher.publish(&msg) catch {
             _ = g_pub_errors.fetchAdd(1, .monotonic);
             continue;
         };

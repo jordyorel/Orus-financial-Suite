@@ -83,7 +83,7 @@ fn handleFakeBank(conn: FakeBankConn) void {
     // Parse minimal pour extraire le STAN (field 11).
     var iso_req = gw_mod.iso8583.parseWithSchema(req_data, &gw_mod.DEFAULT_SCHEMA, alloc) catch {
         // Si parse échoue, répondre quand même RC=00 sans STAN.
-        replyApproved(conn, alloc, "000000") catch {};
+        try replyApproved(conn, alloc, "000000");
         return;
     };
     defer iso_req.deinit();

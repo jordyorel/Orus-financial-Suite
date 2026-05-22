@@ -28,6 +28,7 @@ pub const Server        = http_server.Server;
 pub const Config        = http_server.Config;
 pub const Router        = router.Router;
 pub const BrokerClient  = broker_client.BrokerClient;
+pub const Publisher     = broker_client.Publisher;
 pub const PendingTxStore = state.pending_tx.PendingTxStore;
 pub const ApiClient     = outbound.api_client.ApiClient;
 

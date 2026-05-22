@@ -4,7 +4,9 @@
 //   1. Accept TCP connection.
 //   2. Read the first frame header → determine PUBLISH or SUBSCRIBE.
 //   3a. PUBLISH: dedup → WAL append → fan-out DELIVER → send PUBLISH_ACK.
-//       Connection closes after the single exchange.
+//       Loops reading additional PUBLISH frames on the same connection until
+//       the publisher closes (EOF). One-shot publishers (close after ACK) exit
+//       the loop naturally on EOF — fully backward-compatible.
 //   3b. SUBSCRIBE: read cursor, replay WAL, register Sub, loop reading ACK
 //       frames until disconnect. On each ACK, persist cursor.
 
@@ -90,7 +92,19 @@ fn handleConn(ctx: *ConnCtx) void {
     const remaining: u32 = body_len - 1;
 
     switch (frame_type) {
-        proto.FRAME_PUBLISH   => handlePublish(ctx, r, remaining),
+        proto.FRAME_PUBLISH => {
+            handlePublish(ctx, r, remaining);
+            // Persistent publish loop: keep reading PUBLISH frames until EOF.
+            while (true) {
+                var next_len: [4]u8 = undefined;
+                r.readSliceAll(&next_len) catch return; // EOF = publisher closed normally
+                const next_body = std.mem.readInt(u32, &next_len, .big);
+                if (next_body == 0 or next_body > proto.MAX_PAYLOAD) return;
+                const next_type = r.takeByte() catch return;
+                if (next_type != proto.FRAME_PUBLISH) return;
+                handlePublish(ctx, r, next_body - 1);
+            }
+        },
         proto.FRAME_SUBSCRIBE => handleSubscribe(ctx, r, remaining),
         else => {},
     }

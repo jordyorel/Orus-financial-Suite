@@ -45,7 +45,12 @@
       "Read(//opt/homebrew/Cellar/zig/0.16.0/lib/zig/**)",
       "Bash(grep -r \"std.posix.getenv\\\\|posix\\\\.getenv\" /usr/local/lib/zig/std/ 2>/dev/null | head -5 || grep -r \"posix.getenv\" ~/.zvm/0.16.0/files/lib/std/ 2>/dev/null | head -5 || zig env 2>/dev/null | head -5)",
       "Read(//usr/local/lib/zig/**)",
-      "Read(//Users/hierat/.zvm/0.16.0/files/lib/**)"
+      "Read(//Users/hierat/.zvm/0.16.0/files/lib/**)",
+      "Read(//private/tmp/**)",
+      "Bash(xxd /tmp/demo_pipeline.wal)",
+      "Bash(xxd /tmp/bench_broker.wal)",
+      "Bash(sysctl *)",
+      "Bash(BENCH_PUB_THREADS=2 BENCH_DURATION=30 BENCH_DECLINE_RATE=0 zig build *)"
     ]
   }
 }

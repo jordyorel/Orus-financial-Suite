@@ -157,6 +157,70 @@ pub const BrokerClient = struct {
     }
 };
 
+// Publisher — connexion TCP persistante réutilisée pour tous les messages.
+// Une instance par thread publisher. Reconnexion automatique sur erreur.
+pub const Publisher = struct {
+    config: Config,
+    io:     std.Io,
+    stream: ?std.Io.net.Stream,
+
+    pub fn init(config: Config, io: std.Io) Publisher {
+        return .{ .config = config, .io = io, .stream = null };
+    }
+
+    pub fn deinit(self: *Publisher) void {
+        if (self.stream) |s| s.close(self.io);
+        self.stream = null;
+    }
+
+    fn connect(self: *Publisher) !void {
+        const addr = std.Io.net.IpAddress.parse(self.config.host, self.config.port) catch
+            return error.BrokerUnavailable;
+        self.stream = addr.connect(self.io, .{ .mode = .stream }) catch
+            return error.BrokerUnavailable;
+    }
+
+    pub fn publish(self: *Publisher, msg: *const orusshare.InternalMessage) !void {
+        if (self.stream == null) try self.connect();
+        self.doPublish(msg) catch {
+            // Connexion périmée : fermer, reconnecter, réessayer une fois.
+            if (self.stream) |s| { s.close(self.io); self.stream = null; }
+            try self.connect();
+            try self.doPublish(msg);
+        };
+    }
+
+    fn doPublish(self: *Publisher, msg: *const orusshare.InternalMessage) !void {
+        const stream = self.stream orelse return error.BrokerUnavailable;
+
+        var payload_list: std.ArrayList(u8) = .empty;
+        try payload_list.ensureTotalCapacity(std.heap.page_allocator, 4096);
+        var pw = std.Io.Writer.fromArrayList(&payload_list);
+        serialize.serialize(msg, &pw) catch return error.BrokerUnavailable;
+        var payload_al = std.Io.Writer.toArrayList(&pw);
+        defer payload_al.deinit(std.heap.page_allocator);
+        const payload = payload_al.items;
+
+        const topic_len: u16 = @intCast(msg.topic.len);
+        const frame_len: u32 = @intCast(1 + 2 + msg.topic.len + payload.len);
+
+        var write_buf: [8192]u8 = undefined;
+        var sw = stream.writer(self.io, &write_buf);
+        const w = &sw.interface;
+        w.writeInt(u32, frame_len, .big) catch return error.BrokerUnavailable;
+        w.writeByte(FRAME_PUBLISH)       catch return error.BrokerUnavailable;
+        w.writeInt(u16, topic_len, .big) catch return error.BrokerUnavailable;
+        w.writeAll(msg.topic)            catch return error.BrokerUnavailable;
+        w.writeAll(payload)              catch return error.BrokerUnavailable;
+        w.flush()                        catch return error.BrokerUnavailable;
+
+        var read_buf: [16]u8 = undefined;
+        var sr = stream.reader(self.io, &read_buf);
+        const ack = sr.interface.takeByte() catch return error.BrokerUnavailable;
+        if (ack != 0x06) return error.BrokerNack;
+    }
+};
+
 pub const BrokerClientError = error{
     BrokerUnavailable,
     BrokerNack,
