@@ -97,6 +97,50 @@ pub fn build(b: *std.Build) void {
     const run_broker_step = b.step("run-broker", "Run OrusBroker");
     run_broker_step.dependOn(&run_broker.step);
 
+    // ── Demo ─────────────────────────────────────────────────────────────────
+    const demo_mod = b.addModule("broker-demo", .{
+        .root_source_file = b.path("tools/broker_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    demo_mod.addImport("orusshare",   orusshare_mod);
+    demo_mod.addImport("orusbroker",  orusbroker_mod);
+    demo_mod.addImport("orusconnect", orusconnect_mod);
+
+    const demo_exe = b.addExecutable(.{ .name = "broker-demo", .root_module = demo_mod });
+    const run_demo = b.addRunArtifact(demo_exe);
+    const demo_step = b.step("demo", "Démonstration broker en temps réel");
+    demo_step.dependOn(&run_demo.step);
+
+    const full_demo_mod = b.addModule("full-pipeline-demo", .{
+        .root_source_file = b.path("tools/full_pipeline_demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    full_demo_mod.addImport("orusshare",   orusshare_mod);
+    full_demo_mod.addImport("orusbroker",  orusbroker_mod);
+    full_demo_mod.addImport("orusconnect", orusconnect_mod);
+    full_demo_mod.addImport("orusgateway", orusgateway_mod);
+
+    const full_demo_exe = b.addExecutable(.{ .name = "full-pipeline-demo", .root_module = full_demo_mod });
+    const run_full_demo = b.addRunArtifact(full_demo_exe);
+    const full_demo_step = b.step("demo-full", "Démonstration pipeline complet D1+D2");
+    full_demo_step.dependOn(&run_full_demo.step);
+
+    const bench_mod = b.addModule("benchmark", .{
+        .root_source_file = b.path("tools/benchmark.zig"),
+        .target = target,
+        .optimize = .ReleaseFast, // benchmark en mode optimisé
+    });
+    bench_mod.addImport("orusshare",   orusshare_mod);
+    bench_mod.addImport("orusbroker",  orusbroker_mod);
+    bench_mod.addImport("orusconnect", orusconnect_mod);
+
+    const bench_exe = b.addExecutable(.{ .name = "benchmark", .root_module = bench_mod });
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Benchmark throughput + latence");
+    bench_step.dependOn(&run_bench.step);
+
     const test_step = b.step("test", "Run all unit tests");
 
     // orusshare tests

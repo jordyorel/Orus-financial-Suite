@@ -85,19 +85,21 @@ const ConnCtx = struct {
 };
 
 fn handleConn(ctx: *ConnCtx) void {
-    defer ctx.stream.close(ctx.server.io);
-    defer ctx.alloc.destroy(ctx);
-
-    const s = ctx.server;
-    const alloc = ctx.alloc;
-    const io = s.io;
+    // Save before any defer: LIFO order means destroy(ctx) would run before
+    // close(io) if we used ctx.server.io in the close defer — use-after-free.
+    const stream = ctx.stream;
+    const s      = ctx.server;
+    const alloc  = ctx.alloc;
+    const io     = s.io;
+    defer alloc.destroy(ctx);
+    defer stream.close(io);
 
     var rbuf: [8192]u8 = undefined;
-    var sr = ctx.stream.reader(io, &rbuf);
+    var sr = stream.reader(io, &rbuf);
     var r = &sr.interface;
 
     var wbuf: [8192]u8 = undefined;
-    var sw = ctx.stream.writer(io, &wbuf);
+    var sw = stream.writer(io, &wbuf);
     var w = &sw.interface;
 
     // ── Read ISO 8583 frame ────────────────────────────────────────────────────
