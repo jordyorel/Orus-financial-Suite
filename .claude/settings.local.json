@@ -58,7 +58,11 @@
       "Bash(xargs ls -la)",
       "Bash(pkill -INT -f \"zig-out/bin/pipeline\")",
       "Bash(pkill -INT -f \"pipeline_bench\")",
-      "Bash(pkill -INT -f \"pipeline\")"
+      "Bash(pkill -INT -f \"pipeline\")",
+      "Bash(.zig-cache/o/e6ceb6522cd724911be0148ca00e70a2/test)",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(./zig-cache/bin/demo-full)",
+      "Bash(/opt/homebrew/Cellar/zig/0.16.0/bin/zig build *)"
     ]
   }
 }

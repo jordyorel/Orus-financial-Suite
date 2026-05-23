@@ -37,8 +37,12 @@ fn buildSpecs() [129]?FieldSpec {
     s[43] = .{ .kind = .fixed,  .len = 40  }; // Card Acceptor Name/Location
     s[49] = .{ .kind = .fixed,  .len = 3   }; // Currency Code
     s[60]  = .{ .kind = .lllvar, .len = 120 }; // Reconciliation totals (advisory)
+    s[64]  = .{ .kind = .fixed,  .len = 8   }; // MAC primary   (8 raw bytes)
+    s[70]  = .{ .kind = .fixed,  .len = 3   }; // Network Management Information Code
+    s[96]  = .{ .kind = .llvar,  .len = 32  }; // Key material  (sign-on key exchange)
     s[102] = .{ .kind = .llvar,  .len = 28  }; // Account Identification 1
     s[103] = .{ .kind = .llvar,  .len = 28  }; // Account Identification 2
+    s[128] = .{ .kind = .fixed,  .len = 8   }; // MAC secondary (secondary bitmap)
 
     return s;
 }

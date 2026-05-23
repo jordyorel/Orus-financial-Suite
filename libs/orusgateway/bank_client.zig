@@ -46,6 +46,18 @@ pub const BankClient = struct {
         msg: *const IsoMessage,
         alloc: std.mem.Allocator,
     ) BankClientError!IsoMessage {
+        const payload = parser.serialize(msg, alloc) catch return error.BankUnreachable;
+        defer alloc.free(payload);
+        return self.sendBytes(payload, alloc);
+    }
+
+    // Like send() but accepts pre-serialized wire bytes — avoids re-serialization
+    // when the caller has already built the bytes (e.g. after MAC computation).
+    pub fn sendBytes(
+        self:      *const BankClient,
+        req_bytes: []const u8,
+        alloc:     std.mem.Allocator,
+    ) BankClientError!IsoMessage {
         const addr = std.Io.net.IpAddress.parse(self.config.host, self.config.port) catch
             return error.BankUnreachable;
         var stream = addr.connect(self.io, .{ .mode = .stream }) catch return error.BankUnreachable;
@@ -57,7 +69,7 @@ pub const BankClient = struct {
         var sw = stream.writer(self.io, &write_buf);
 
         switch (self.config.tls) {
-            .none => return self.doExchange(&sr.interface, &sw.interface, msg, alloc),
+            .none => return self.doExchangeRaw(&sr.interface, &sw.interface, req_bytes, alloc),
             .self_signed => {
                 var tls_read: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
                 var tls_write: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
@@ -72,24 +84,21 @@ pub const BankClient = struct {
                     .realtime_now  = std.Io.Clock.real.now(self.io),
                 }) catch return error.BankUnreachable;
                 defer tls.end() catch {};
-                return self.doExchange(&tls.reader, &tls.writer, msg, alloc);
+                return self.doExchangeRaw(&tls.reader, &tls.writer, req_bytes, alloc);
             },
         }
     }
 
-    fn doExchange(
-        self: *const BankClient,
-        r: *std.Io.Reader,
-        w: *std.Io.Writer,
-        msg: *const IsoMessage,
-        alloc: std.mem.Allocator,
+    fn doExchangeRaw(
+        self:      *const BankClient,
+        r:         *std.Io.Reader,
+        w:         *std.Io.Writer,
+        req_bytes: []const u8,
+        alloc:     std.mem.Allocator,
     ) BankClientError!IsoMessage {
-        const payload = parser.serialize(msg, alloc) catch return error.BankUnreachable;
-        defer alloc.free(payload);
-
-        writeLengthPrefix(w, payload.len, self.config.length_prefix) catch
+        writeLengthPrefix(w, req_bytes.len, self.config.length_prefix) catch
             return error.BankUnreachable;
-        w.writeAll(payload) catch return error.BankUnreachable;
+        w.writeAll(req_bytes) catch return error.BankUnreachable;
         w.flush() catch return error.BankUnreachable;
 
         const resp_len = readLengthPrefix(r, self.config.length_prefix) catch

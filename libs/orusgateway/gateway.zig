@@ -3,42 +3,75 @@ const orusshare = @import("orusshare");
 const translator = @import("translator.zig");
 const bank_client_mod = @import("bank_client.zig");
 const reconciliation_mod = @import("reconciliation.zig");
+const network_mgmt = @import("network_mgmt.zig");
+const mac_mod = @import("mac.zig");
 const parser = @import("iso8583/parser.zig");
 
 pub const InternalMessage = orusshare.InternalMessage;
 pub const BankClient = bank_client_mod.BankClient;
 pub const BankClientError = bank_client_mod.BankClientError;
 pub const ReconciliationState = reconciliation_mod.ReconciliationState;
+pub const MacEngine = mac_mod.MacEngine;
 
-pub const GatewayError = translator.TranslateError || BankClientError;
+pub const GatewayError = translator.TranslateError || BankClientError || error{MacMismatch};
+pub const NetworkError = BankClientError || error{ SignOnRejected, HeartbeatFailed };
 
 pub const Gateway = struct {
-    bank: BankClient,
-    pan_hash_seed: u64,
+    bank:           BankClient,
+    pan_hash_seed:  u64,
     reconciliation: ?*ReconciliationState = null,
+    mac_engine:     ?*MacEngine           = null,
 
     pub fn init(bank: BankClient, pan_hash_seed: u64) Gateway {
         return .{ .bank = bank, .pan_hash_seed = pan_hash_seed };
     }
 
-    // Full pipeline: InternalMessage → ISO 8583 request → bank → ISO 8583 response → InternalMessage.
-    //
-    // Ownership: result.fields is allocated with alloc. Caller frees with:
-    //   for (result.fields) |f| alloc.free(f.value);
-    //   alloc.free(result.fields);
+    // Full pipeline: InternalMessage → ISO 8583 → bank → ISO 8583 → InternalMessage.
+    // If mac_engine is active, appends MAC (F64) to the outbound message and
+    // verifies MAC on the response (returns MacMismatch on failure).
     pub fn process(
-        self: *const Gateway,
-        req: *const InternalMessage,
+        self:  *const Gateway,
+        req:   *const InternalMessage,
         alloc: std.mem.Allocator,
     ) GatewayError!InternalMessage {
         var iso_req = try translator.fromInternal(req, alloc);
         defer iso_req.deinit();
 
-        var iso_resp = try self.bank.send(&iso_req, alloc);
+        // Append MAC to outbound request, then send pre-serialized bytes to
+        // avoid a third serialization (scope bytes + wire bytes + bank.send bytes).
+        var iso_resp = mac_blk: {
+            if (self.mac_engine) |mac| {
+                if (mac.active) {
+                    // 1st serialization: scope without F64
+                    const scope = parser.serialize(&iso_req, alloc) catch return error.OutOfMemory;
+                    defer alloc.free(scope);
+                    const mac_bytes = mac.compute(scope);
+                    iso_req.set(64, &mac_bytes) catch return error.OutOfMemory;
+                    // 2nd serialization: wire bytes with F64 set — sent directly
+                    const wire = parser.serialize(&iso_req, alloc) catch return error.OutOfMemory;
+                    defer alloc.free(wire);
+                    break :mac_blk try self.bank.sendBytes(wire, alloc);
+                }
+            }
+            break :mac_blk try self.bank.send(&iso_req, alloc);
+        };
         defer iso_resp.deinit();
 
+        // Verify MAC on bank response — reject the transaction on mismatch.
+        if (self.mac_engine) |mac| if (mac.active) {
+            const mac_ok: bool = blk: {
+                const received_mac = iso_resp.get(64) orelse break :blk false;
+                var clone = mac_mod.cloneWithoutMac(&iso_resp, alloc) catch break :blk false;
+                defer clone.deinit();
+                const rd = parser.serialize(&clone, alloc) catch break :blk false;
+                defer alloc.free(rd);
+                break :blk mac.verify(rd, received_mac);
+            };
+            if (!mac_ok) return error.MacMismatch;
+        };
+
         var base = req.*;
-        base.origin = .iso8583;
+        base.origin    = .iso8583;
         base.hop_count +|= 1;
         base.received_at = @intCast(std.Io.Clock.real.now(self.bank.io).nanoseconds);
 
@@ -47,13 +80,11 @@ pub const Gateway = struct {
         return result;
     }
 
-    // Send a reversal for an approved payment.
-    // Builds MTI 0420 (or 0421) from `original`, sends it to the bank, returns the 0430 response.
-    // Use when the MoMo callback was never delivered after a bank approval.
+    // Send a reversal for an approved payment (0420/0421 → 0430).
     pub fn processReversal(
-        self: *const Gateway,
+        self:     *const Gateway,
         original: *const InternalMessage,
-        alloc: std.mem.Allocator,
+        alloc:    std.mem.Allocator,
     ) GatewayError!InternalMessage {
         var rev = try translator.buildReversal(original, alloc);
         defer {
@@ -61,6 +92,42 @@ pub const Gateway = struct {
             alloc.free(rev.fields);
         }
         return self.process(&rev, alloc);
+    }
+
+    // Send sign-on (0800/NMI=301). Stores session key from F96 into mac_engine.
+    pub fn signOn(self: *const Gateway, stan: *u32, alloc: std.mem.Allocator) NetworkError!void {
+        var req = network_mgmt.buildRequest(network_mgmt.NMI.SIGNON, stan, alloc)
+            catch return error.BankUnreachable;
+        defer req.deinit();
+        var resp = try self.bank.send(&req, alloc);
+        defer resp.deinit();
+        const rc = resp.get(39) orelse return error.SignOnRejected;
+        if (!std.mem.eql(u8, rc, "00")) return error.SignOnRejected;
+        if (self.mac_engine) |mac| {
+            if (resp.get(96)) |key| mac.setKey(key);
+        }
+    }
+
+    // Send sign-off (0800/NMI=302). Best-effort.
+    pub fn signOff(self: *const Gateway, stan: *u32, alloc: std.mem.Allocator) void {
+        var req = network_mgmt.buildRequest(network_mgmt.NMI.SIGNOFF, stan, alloc) catch return;
+        defer req.deinit();
+        var resp = self.bank.send(&req, alloc) catch return;
+        defer resp.deinit();
+        const rc = resp.get(39) orelse "";
+        if (!std.mem.eql(u8, rc, "00"))
+            std.log.warn("gateway: sign-off rejected RC={s}", .{rc});
+    }
+
+    // Send heartbeat (0800/NMI=801). Call every ~30s to keep TCP session alive.
+    pub fn sendHeartbeat(self: *const Gateway, stan: *u32, alloc: std.mem.Allocator) NetworkError!void {
+        var req = network_mgmt.buildRequest(network_mgmt.NMI.ECHO, stan, alloc)
+            catch return error.BankUnreachable;
+        defer req.deinit();
+        var resp = try self.bank.send(&req, alloc);
+        defer resp.deinit();
+        const rc = resp.get(39) orelse return error.HeartbeatFailed;
+        if (!std.mem.eql(u8, rc, "00")) return error.HeartbeatFailed;
     }
 };
 
@@ -73,7 +140,7 @@ const TEST_PORT: u16 = 19233;
 fn buildApproval(alloc: std.mem.Allocator, stan: []const u8) ![]u8 {
     var resp = parser.IsoMessage.init(alloc, "0210".*);
     defer resp.deinit();
-    try resp.set(39, "00"); // approved
+    try resp.set(39, "00");
     try resp.set(11, stan[0..6]);
     try resp.set(49, "XAF");
     return parser.serialize(&resp, alloc);
@@ -82,13 +149,12 @@ fn buildApproval(alloc: std.mem.Allocator, stan: []const u8) ![]u8 {
 fn buildDecline(alloc: std.mem.Allocator, stan: []const u8) ![]u8 {
     var resp = parser.IsoMessage.init(alloc, "0210".*);
     defer resp.deinit();
-    try resp.set(39, "51"); // insufficient funds
+    try resp.set(39, "51");
     try resp.set(11, stan[0..6]);
     try resp.set(49, "XAF");
     return parser.serialize(&resp, alloc);
 }
 
-// Fake bank: serves one framed ISO request and replies with `response_bytes`.
 fn serveBankOnce(
     server: *std.Io.net.Server,
     io: std.Io,
@@ -98,7 +164,6 @@ fn serveBankOnce(
     var stream = server.accept(io) catch return;
     defer stream.close(io);
 
-    // Drain the inbound 2-byte-prefixed request
     var rbuf: [8192]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
     var r = &sr.interface;
@@ -109,7 +174,6 @@ fn serveBankOnce(
     defer alloc.free(tmp);
     r.readSliceAll(tmp) catch return;
 
-    // Send back 2-byte-prefixed response
     var wbuf: [8192]u8 = undefined;
     var sw = stream.writer(io, &wbuf);
     var w = &sw.interface;
@@ -165,20 +229,15 @@ test "Gateway.process: approved 0210 response" {
         alloc.free(resp.fields);
     }
 
-    // MTI and response code
     try testing.expectEqualSlices(u8, "0210", &resp.mti);
     var rc: ?[]const u8 = null;
     for (resp.fields) |f| {
         if (f.id == 39) rc = f.value;
     }
     try testing.expectEqualStrings("00", rc.?);
-
-    // Gateway metadata updated
     try testing.expectEqual(orusshare.MessageOrigin.iso8583, resp.origin);
-    try testing.expectEqual(@as(u8, 2), resp.hop_count); // was 1, incremented to 2
+    try testing.expectEqual(@as(u8, 2), resp.hop_count);
     try testing.expect(resp.received_at != 0);
-
-    // Identity preserved
     try testing.expectEqualSlices(u8, &req.msg_id, &resp.msg_id);
     try testing.expectEqualStrings(req.topic, resp.topic);
 }

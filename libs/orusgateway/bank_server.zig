@@ -6,15 +6,21 @@ const schema_mod = @import("iso8583/schema.zig");
 const bank_client_mod = @import("bank_client.zig");
 const broker_mod = @import("broker_client.zig");
 const reconciliation_mod = @import("reconciliation.zig");
+const network_mgmt = @import("network_mgmt.zig");
+const mac_mod = @import("mac.zig");
 
 // BankServer — Direction 2 (Banque → MoMo).
 //
 // Listens for incoming ISO 8583 connections from bank / switch.
 // For each message:
 //   1. Parse ISO 8583 with the configured schema.
-//   2. Translate to InternalMessage via toInternal().
-//   3. Publish to OrusBroker (best-effort — see note below).
-//   4. Send a provisional 0210 response (RC=00) immediately.
+//   2. Detect network management (0800) → respond 0810 immediately.
+//   3. Detect reconciliation (0500) → respond 0510 immediately.
+//   4. Translate to InternalMessage via toInternal().
+//   5. Verify MAC on inbound message if mac_engine is active.
+//   6. Record to audit log.
+//   7. Publish to OrusBroker (best-effort).
+//   8. Send a provisional 0210 response (RC=00).
 //
 // Note: the provisional ACK means OrusGateway acknowledges receipt without
 // waiting for the full MoMo API round-trip. The actual outcome arrives via
@@ -35,6 +41,12 @@ pub const BankServer = struct {
     broker: broker_mod.BrokerClient,
     pan_hash_seed: u64 = 0,
     reconciliation: ?*reconciliation_mod.ReconciliationState = null,
+    mac_engine: ?*mac_mod.MacEngine = null,
+    audit_log: ?*orusshare.AuditLog = null,
+    // Key material delivered in F96 at sign-on (NMI=301).
+    // Set by the caller before serve() — loaded from env, file, or HSM.
+    // null = no key exchange (sign-on succeeds but MAC stays inactive).
+    session_key_material: ?[]const u8 = null,
 
     pub fn init(
         config: Config,
@@ -86,8 +98,6 @@ const ConnCtx = struct {
 };
 
 fn handleConn(ctx: *ConnCtx) void {
-    // Save before any defer: LIFO order means destroy(ctx) would run before
-    // close(io) if we used ctx.server.io in the close defer — use-after-free.
     const stream = ctx.stream;
     const s      = ctx.server;
     const alloc  = ctx.alloc;
@@ -118,6 +128,31 @@ fn handleConn(ctx: *ConnCtx) void {
     };
     defer iso_msg.deinit();
 
+    // ── Network management (0800) → respond 0810 ──────────────────────────────
+    if (network_mgmt.isNetworkMgmt(iso_msg.mti)) {
+        const nmi = iso_msg.get(70) orelse "";
+        const key_material: []const u8 = if (std.mem.eql(u8, nmi, network_mgmt.NMI.SIGNON))
+            (s.session_key_material orelse "")
+        else
+            "";
+        var resp_iso = network_mgmt.buildResponse(&iso_msg, alloc, key_material) catch return;
+        defer resp_iso.deinit();
+        const resp_bytes = parser.serializeWithSchema(&resp_iso, s.schema, alloc) catch return;
+        defer alloc.free(resp_bytes);
+        writeLenPrefix(w, resp_bytes.len, s.config.length_prefix) catch return;
+        w.writeAll(resp_bytes) catch return;
+        w.flush() catch return;
+        // Activate our own MacEngine with the key we just delivered to the switch,
+        // so that subsequent financial messages from the switch are verified.
+        if (std.mem.eql(u8, nmi, network_mgmt.NMI.SIGNON)) {
+            if (key_material.len > 0) {
+                if (s.mac_engine) |mac| mac.setKey(key_material);
+            }
+        }
+        std.log.info("bank_server: 0800/NMI={s} → 0810 sent", .{nmi});
+        return;
+    }
+
     // ── Reconciliation request (0500) → respond 0510 immediately ─────────────
     if (std.mem.eql(u8, &iso_msg.mti, "0500")) {
         const rec = s.reconciliation orelse {
@@ -134,6 +169,32 @@ fn handleConn(ctx: *ConnCtx) void {
         std.log.info("bank_server: reconciliation 0500 → 0510 sent", .{});
         return;
     }
+
+    // ── MAC verification — reject on mismatch or absent F64 (GIMAC mandatory) ──
+    if (s.mac_engine) |mac| if (mac.active) {
+        const mac_ok: bool = blk: {
+            const received_mac = iso_msg.get(64) orelse break :blk false;
+            var clone = mac_mod.cloneWithoutMac(&iso_msg, alloc) catch break :blk false;
+            defer clone.deinit();
+            const data = parser.serialize(&clone, alloc) catch break :blk false;
+            defer alloc.free(data);
+            break :blk mac.verify(data, received_mac);
+        };
+        if (!mac_ok) {
+            std.log.warn("bank_server: MAC invalid — sending RC=94, dropping connection", .{});
+            var rej = parser.IsoMessage.init(alloc, "0210".*);
+            defer rej.deinit();
+            rej.set(39, "94") catch return;
+            if (iso_msg.get(11)) |stan| rej.set(11, stan) catch {};
+            if (parser.serializeWithSchema(&rej, s.schema, alloc) catch null) |bytes| {
+                defer alloc.free(bytes);
+                writeLenPrefix(w, bytes.len, s.config.length_prefix) catch return;
+                w.writeAll(bytes) catch return;
+                w.flush() catch return;
+            }
+            return;
+        }
+    };
 
     // ── toInternal ────────────────────────────────────────────────────────────
     var msg_id: [16]u8 = undefined;
@@ -165,6 +226,21 @@ fn handleConn(ctx: *ConnCtx) void {
     defer {
         for (im.fields) |f| alloc.free(f.value);
         alloc.free(im.fields);
+    }
+
+    // ── Audit log ─────────────────────────────────────────────────────────────
+    if (s.audit_log) |log| {
+        var rc_val: []const u8 = "";
+        for (im.fields) |f| if (f.id == 39) { rc_val = f.value; };
+        log.record(
+            &im.mti,
+            &im.stan,
+            im.amount,
+            &im.currency,
+            rc_val,
+            @tagName(im.provider),
+            im.msg_id,
+        );
     }
 
     // ── Record for reconciliation ─────────────────────────────────────────────

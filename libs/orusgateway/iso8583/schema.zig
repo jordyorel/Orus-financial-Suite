@@ -155,10 +155,14 @@ const DEFAULT_FIELDS = [_]FieldDef{
     .{ .id = 41,  .name = "TermID",     .field_type = .FIXED,  .encoding = .ASCII, .length = 8  },
     .{ .id = 42,  .name = "MerchID",    .field_type = .FIXED,  .encoding = .ASCII, .length = 15 },
     .{ .id = 43,  .name = "MerchName",  .field_type = .FIXED,  .encoding = .ASCII, .length = 40 },
-    .{ .id = 49,  .name = "Currency",        .field_type = .FIXED,  .encoding = .ASCII, .length = 3   },
-    .{ .id = 60,  .name = "Reconciliation",  .field_type = .LLLVAR, .encoding = .ASCII, .length = 120 },
-    .{ .id = 102, .name = "AccountID1",      .field_type = .LLVAR,  .encoding = .ASCII, .length = 28  },
-    .{ .id = 103, .name = "AccountID2",      .field_type = .LLVAR,  .encoding = .ASCII, .length = 28  },
+    .{ .id = 49,  .name = "Currency",        .field_type = .FIXED,  .encoding = .ASCII,  .length = 3   },
+    .{ .id = 60,  .name = "Reconciliation",  .field_type = .LLLVAR, .encoding = .ASCII,  .length = 120 },
+    .{ .id = 64,  .name = "MAC",             .field_type = .FIXED,  .encoding = .BINARY, .length = 8   },
+    .{ .id = 70,  .name = "NMI",             .field_type = .FIXED,  .encoding = .ASCII,  .length = 3   },
+    .{ .id = 96,  .name = "KeyMaterial",     .field_type = .LLVAR,  .encoding = .ASCII,  .length = 32  },
+    .{ .id = 102, .name = "AccountID1",      .field_type = .LLVAR,  .encoding = .ASCII,  .length = 28  },
+    .{ .id = 103, .name = "AccountID2",      .field_type = .LLVAR,  .encoding = .ASCII,  .length = 28  },
+    .{ .id = 128, .name = "MAC2",            .field_type = .FIXED,  .encoding = .BINARY, .length = 8   },
 };
 
 pub const DEFAULT_SCHEMA = IsoSchema{

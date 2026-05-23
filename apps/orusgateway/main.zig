@@ -197,6 +197,7 @@ fn handleConn(ctx: *ConnCtx) void {
         const code: u8 = switch (err) {
             error.BankUnreachable, error.ResponseTooLarge, error.MalformedResponse => ERR_BANK,
             error.MissingAmount, error.InvalidAmount, error.MissingCurrency => ERR_TRANSLATE,
+            error.MacMismatch => ERR_BANK,
             error.OutOfMemory => ERR_INTERNAL,
         };
         sendError(w, code) catch {};
@@ -329,12 +330,38 @@ pub fn main() !void {
     const health_thread = try std.Thread.spawn(.{}, serveHealth, .{&health_args});
     health_thread.detach();
 
+    // ── MAC engine — shared between D1 (Gateway) and D2 (BankServer) ────────
+    // Key for D1 comes from the bank's F96 response at sign-on.
+    // Key for D2 is set via GATEWAY_SESSION_KEY env var and delivered to the
+    // inbound switch in F96; the MacEngine is then activated by BankServer
+    // after sign-on so it can verify subsequent financial messages.
+    // If GATEWAY_SESSION_KEY is absent, MAC stays inactive (warn at startup).
+    const mac_engine_ptr = try alloc.create(orusgateway.MacEngine);
+    mac_engine_ptr.* = orusgateway.MacEngine.init();
+    defer alloc.destroy(mac_engine_ptr);
+
+    const session_key_material: ?[]const u8 = if (getenv("GATEWAY_SESSION_KEY")) |k|
+        try alloc.dupe(u8, k)
+    else blk: {
+        std.log.warn("GATEWAY_SESSION_KEY not set — MAC will be inactive until sign-on", .{});
+        break :blk null;
+    };
+    defer if (session_key_material) |k| alloc.free(k);
+
     // ── Direction 1: InternalMessage listener (broker pushes to us) ─────────
-    const gw = Gateway.init(BankClient.init(.{
+    var gw = Gateway.init(BankClient.init(.{
         .host = config.bank_host,
         .port = config.bank_port,
         .length_prefix = config.bank_prefix,
     }, io), envU64("PAN_HASH_SEED", 0));
+    gw.mac_engine = mac_engine_ptr;
+
+    // Sign-on to outbound bank (D1): sets session key in mac_engine via F96.
+    var d1_stan: u32 = 0;
+    gw.signOn(&d1_stan, alloc) catch |err|
+        std.log.warn("D1 sign-on failed: {} — MAC inactive for outbound bank", .{err});
+    if (mac_engine_ptr.active)
+        std.log.info("D1 sign-on OK — MacEngine active (HMAC-SHA256/8 bytes)", .{});
 
     // ── Direction 2: ISO 8583 listener (bank/switch connects to us) ─────────
     var iso_schema = try resolveIsoSchema(config, io, alloc);
@@ -345,11 +372,13 @@ pub fn main() !void {
         .port = config.broker_port,
     }, io);
 
-    const bank_srv = BankServer.init(.{
+    var bank_srv = BankServer.init(.{
         .host          = config.iso_listen_host,
         .port          = config.iso_listen_port,
         .length_prefix = config.bank_prefix,
     }, io, &iso_schema, broker_gw);
+    bank_srv.mac_engine          = mac_engine_ptr;
+    bank_srv.session_key_material = session_key_material;
 
     var bs_args = BankServerArgs{ .server = &bank_srv, .alloc = alloc };
     const bs_thread = try std.Thread.spawn(.{}, runBankServer, .{&bs_args});

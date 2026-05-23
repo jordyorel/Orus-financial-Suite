@@ -13,6 +13,8 @@ comptime {
     _ = @import("broker_client.zig");
     _ = @import("bank_server.zig");
     _ = @import("reconciliation.zig");
+    _ = @import("network_mgmt.zig");
+    _ = @import("mac.zig");
 }
 
 pub const iso8583 = struct {
@@ -40,15 +42,24 @@ pub const HeaderType     = schema.HeaderType;
 pub const DEFAULT_SCHEMA = schema.DEFAULT_SCHEMA;
 pub const parseIsoSchema = schema.parseIsoSchema;
 
-pub const translator      = @import("translator.zig");
-pub const fromInternal    = translator.fromInternal;
-pub const toInternal      = translator.toInternal;
-pub const buildReversal   = translator.buildReversal;
-pub const isReversal      = translator.isReversal;
+pub const translator       = @import("translator.zig");
+pub const fromInternal     = translator.fromInternal;
+pub const toInternal       = translator.toInternal;
+pub const buildReversal    = translator.buildReversal;
+pub const isReversal       = translator.isReversal;
 pub const isReconciliation = translator.isReconciliation;
 
 pub const reconciliation      = @import("reconciliation.zig");
 pub const ReconciliationState = reconciliation.ReconciliationState;
+
+pub const network_mgmt_mod       = @import("network_mgmt.zig");
+pub const isNetworkMgmt          = network_mgmt_mod.isNetworkMgmt;
+pub const buildNetworkResponse   = network_mgmt_mod.buildResponse;
+pub const buildNetworkRequest    = network_mgmt_mod.buildRequest;
+pub const NMI                    = network_mgmt_mod.NMI;
+
+pub const mac_mod   = @import("mac.zig");
+pub const MacEngine = mac_mod.MacEngine;
 
 pub const bank_client = @import("bank_client.zig");
 pub const BankClient  = bank_client.BankClient;

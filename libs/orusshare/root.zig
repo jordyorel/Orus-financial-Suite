@@ -3,6 +3,7 @@ pub const serialize = @import("serialize.zig");
 pub const hash = @import("hash.zig");
 pub const metrics = @import("metrics.zig");
 pub const errors = @import("errors.zig");
+pub const audit = @import("audit.zig");
 
 // Top-level re-exports for convenience.
 pub const InternalMessage = message.InternalMessage;
@@ -11,10 +12,12 @@ pub const ServiceProvider = message.ServiceProvider;
 pub const Metrics = metrics.Metrics;
 pub const maskPan = hash.maskPan;
 pub const hashPan = hash.hashPan;
+pub const AuditLog = audit.AuditLog;
 
 test {
     _ = @import("message.zig");
     _ = @import("serialize.zig");
     _ = @import("hash.zig");
     _ = @import("metrics.zig");
+    _ = @import("audit.zig");
 }

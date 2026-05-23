@@ -1,12 +1,20 @@
-// Démonstration pipeline complet — deux directions.
+// Démonstration pipeline complet — deux directions + network management + MAC + audit.
 //
 // Composants démarrés in-process :
 //   • OrusBroker                  (port 7796)
-//   • FakeBanqueISO8583           (port 5096)  — répond 0210/RC=00
+//   • FakeBanqueISO8583           (port 5096)  — répond 0210/0430/0810 selon MTI
 //   • Gateway D1 subscriber       (écoute "transactions.inbound")
 //   • Gateway D2 BankServer       (port 7596)
 //   • Observer D1                 (écoute "transactions.inbound", affiche origin=iso8583)
 //   • Observer D2                 (écoute "transactions.outbound")
+//
+// Scénarios :
+//   D0 — Sign-on 0800/301 → FakeBank → 0810 (session key livré en F96)
+//   D1 — MoMo → Broker → Gateway → Banque → 0210 RC=00
+//   D2 — Banque → BankServer → Broker
+//   D3 — Reversal 0420 → FakeBank → 0430 RC=00
+//   D4 — Réconciliation 0500 → BankServer → 0510
+//   D5 — Heartbeat 0800/801 → FakeBank → 0810 RC=00
 //
 // Lancer avec : zig build demo-full
 
@@ -16,12 +24,17 @@ const orusbroker = @import("orusbroker");
 const orusconnect = @import("orusconnect");
 const gw_mod     = @import("orusgateway");
 
-const BROKER_PORT: u16  = 7796;
+const BROKER_PORT: u16    = 7796;
 const FAKE_BANK_PORT: u16 = 5096;
 const BANKSERVER_PORT: u16 = 7596;
 
 const TOPIC_INBOUND  = "transactions.inbound";
 const TOPIC_OUTBOUND = "transactions.outbound";
+
+const AUDIT_LOG_PATH = "/tmp/orus_demo_audit.log";
+
+// Session key delivered by FakeBank at sign-on — must match what we set in setKey.
+const FAKE_SESSION_KEY = "orus_session_key_32bytes_padxxxx";
 
 // ── Utilitaires ───────────────────────────────────────────────────────────────
 
@@ -60,8 +73,11 @@ fn runBroker(inner: *BrokerInner) void {
 }
 
 // ── FakeBanqueISO8583 ─────────────────────────────────────────────────────────
-// Accepte des connexions, lit un frame ISO 8583 (2-octet-len-prefix),
-// répond toujours 0210/RC=00 avec le même STAN.
+// Accepte des connexions, lit un frame ISO 8583 (2-octet-len-prefix).
+// Dispatch par MTI :
+//   0800 → 0810 (sign-on avec F96, echo sans F96)
+//   0420/0421 → 0430 RC=00
+//   autres → 0210 RC=00
 
 const FakeBankConn = struct { stream: std.Io.net.Stream, io: std.Io };
 
@@ -87,6 +103,14 @@ fn handleFakeBank(conn: FakeBankConn) void {
     defer iso_req.deinit();
 
     const stan = iso_req.get(11) orelse "000000";
+
+    // Network management 0800 → 0810
+    if (std.mem.eql(u8, &iso_req.mti, "0800")) {
+        const nmi = iso_req.get(70) orelse "";
+        std.debug.print("  \x1b[90m[FakeBank] reçu MTI=0800 NMI={s} → 0810\x1b[0m\n", .{nmi});
+        replyNetworkMgmt(conn, alloc, &iso_req, nmi) catch {};
+        return;
+    }
 
     // 0420/0421 = reversal request → confirm with 0430
     if (std.mem.eql(u8, &iso_req.mti, "0420") or std.mem.eql(u8, &iso_req.mti, "0421")) {
@@ -123,6 +147,32 @@ fn replyApproved(conn: FakeBankConn, alloc: std.mem.Allocator, stan: []const u8)
 
 fn replyReversal(conn: FakeBankConn, alloc: std.mem.Allocator, stan: []const u8) !void {
     return replyWithMti(conn, alloc, "0430".*, stan);
+}
+
+fn replyNetworkMgmt(
+    conn:    FakeBankConn,
+    alloc:   std.mem.Allocator,
+    request: *const gw_mod.iso8583.IsoMessage,
+    nmi:     []const u8,
+) !void {
+    var resp = gw_mod.iso8583.IsoMessage.init(alloc, "0810".*);
+    defer resp.deinit();
+    try resp.set(39, "00");
+    if (request.get(11)) |stan| try resp.set(11, stan);
+    try resp.set(70, nmi);
+    // Sign-on (NMI=301): deliver session key in F96.
+    if (std.mem.eql(u8, nmi, "301")) {
+        try resp.set(96, FAKE_SESSION_KEY);
+    }
+
+    const resp_bytes = try gw_mod.iso8583.serializeWithSchema(&resp, &gw_mod.DEFAULT_SCHEMA, alloc);
+    defer alloc.free(resp_bytes);
+
+    var wbuf: [4096]u8 = undefined;
+    var sw = conn.stream.writer(conn.io, &wbuf);
+    try sw.interface.writeInt(u16, @intCast(resp_bytes.len), .big);
+    try sw.interface.writeAll(resp_bytes);
+    try sw.interface.flush();
 }
 
 const FakeBankArgs = struct { server: *std.Io.net.Server, io: std.Io };
@@ -299,13 +349,11 @@ fn buildMomoPayment(amount: i64) orusshare.InternalMessage {
 }
 
 // ── Scénario D3 : reversal d'un paiement approuvé ────────────────────────────
-// Simule : callback MoMo jamais livré → Gateway envoie 0420 → Banque confirme 0430.
 
 fn runReversalScenario(
     gateway: *const gw_mod.Gateway,
     alloc: std.mem.Allocator,
 ) void {
-    // Paiement original supposé approuvé (RC=00 reçu mais callback perdu).
     var id: [16]u8 = undefined;
     std.c.arc4random_buf(&id, id.len);
     const approved = orusshare.InternalMessage{
@@ -363,7 +411,7 @@ fn runReconciliationScenario(io: std.Io, alloc: std.mem.Allocator) void {
 
     var iso = gw_mod.iso8583.IsoMessage.init(alloc, "0500".*);
     defer iso.deinit();
-    iso.set(11, "000099") catch return; // STAN de réconciliation
+    iso.set(11, "000099") catch return;
 
     const bytes = gw_mod.iso8583.serializeWithSchema(&iso, &gw_mod.DEFAULT_SCHEMA, alloc) catch return;
     defer alloc.free(bytes);
@@ -443,15 +491,25 @@ pub fn main() !void {
     var fake_bank_args = FakeBankArgs{ .server = &bank_server_sock, .io = io };
     (try std.Thread.spawn(.{}, runFakeBank, .{&fake_bank_args})).detach();
 
-    // ── 3. Gateway D1 subscriber ──────────────────────────────────────────────
+    // ── 3. MacEngine (partagé Gateway + BankServer) ───────────────────────────
+    var mac_engine = gw_mod.MacEngine.init();
+
+    // ── 4. AuditLog ───────────────────────────────────────────────────────────
+    std.Io.Dir.cwd().deleteFile(io, AUDIT_LOG_PATH) catch {};
+    var audit_log = try orusshare.AuditLog.open(io, AUDIT_LOG_PATH);
+    defer audit_log.close();
+
+    // ── 5. ReconciliationState (partagé) ──────────────────────────────────────
     var recon_state = gw_mod.ReconciliationState.init();
 
+    // ── 6. Gateway D1 subscriber ──────────────────────────────────────────────
     var gateway = gw_mod.Gateway.init(gw_mod.BankClient.init(.{
         .host          = "127.0.0.1",
         .port          = FAKE_BANK_PORT,
         .length_prefix = .two_byte_be,
     }, io), 0);
     gateway.reconciliation = &recon_state;
+    gateway.mac_engine     = &mac_engine;
 
     var d1_received = std.atomic.Value(usize).init(0);
     var d1_args = D1LoopArgs{
@@ -462,9 +520,8 @@ pub fn main() !void {
     };
     (try std.Thread.spawn(.{}, runD1Loop, .{&d1_args})).detach();
 
-    // ── 4. Gateway D2 BankServer ──────────────────────────────────────────────
+    // ── 7. Gateway D2 BankServer ──────────────────────────────────────────────
     const d2_broker = gw_mod.GatewayBrokerClient.init(.{ .host = "127.0.0.1", .port = BROKER_PORT }, io);
-    // Heap-alloué pour que le pointeur reste valide dans les threads détachés.
     const bank_srv = try std.heap.page_allocator.create(gw_mod.BankServer);
     bank_srv.* = gw_mod.BankServer.init(.{
         .host          = "127.0.0.1",
@@ -472,15 +529,16 @@ pub fn main() !void {
         .length_prefix = .two_byte_be,
         .topic         = TOPIC_OUTBOUND,
     }, io, &gw_mod.DEFAULT_SCHEMA, d2_broker);
-
     bank_srv.reconciliation = &recon_state;
+    bank_srv.mac_engine     = &mac_engine;
+    bank_srv.audit_log      = &audit_log;
 
     const BankSrvRunner = struct {
         fn run(s: *const gw_mod.BankServer) void { s.serve(std.heap.page_allocator) catch {}; }
     };
     (try std.Thread.spawn(.{}, BankSrvRunner.run, .{bank_srv})).detach();
 
-    // ── 5. Observers ──────────────────────────────────────────────────────────
+    // ── 8. Observers ──────────────────────────────────────────────────────────
     var obs_d1_count = std.atomic.Value(usize).init(0);
     var obs_d1_args  = ObsD1Args{ .io = io, .count = &obs_d1_count, .target = 1 };
     (try std.Thread.spawn(.{}, runObsD1, .{&obs_d1_args})).detach();
@@ -496,8 +554,23 @@ pub fn main() !void {
     std.debug.print("  Broker:{d}  FakeBank:{d}  BankServer:{d}\n",
         .{ BROKER_PORT, FAKE_BANK_PORT, BANKSERVER_PORT });
 
+    // ── Scénario D0 : Sign-on 0800/301 → FakeBank → 0810 (clé de session F96) ─
+    banner("── D0 : Sign-on 0800/301 → FakeBank → 0810 ────────────────────");
+    var stan: u32 = 0;
+    pub_("Envoi 0800/NMI=301 (sign-on) → FakeBank port {d}", .{FAKE_BANK_PORT});
+    gateway.signOn(&stan, alloc) catch |err| {
+        std.debug.print("  \x1b[31m✗ signOn erreur: {}\x1b[0m\n", .{err});
+    };
+    if (mac_engine.active) {
+        ok("D0 complet : session key reçue, MacEngine actif.", .{});
+    } else {
+        std.debug.print("  \x1b[33m⚠ D0 : sign-on réussi mais F96 absent (MacEngine inactif)\x1b[0m\n", .{});
+    }
+
+    sleep_ms(100);
+
     // ── Scénario D1 : MoMo → Broker → Gateway → Banque ───────────────────────
-    banner("── DIRECTION 1 : MoMo → Broker → Gateway → Banque ─────────────");
+    banner("── D1 : MoMo → Broker → Gateway → Banque ──────────────────────");
 
     const payment = buildMomoPayment(10_000);
     const pub_client = orusconnect.BrokerClient.init(.{ .host = "127.0.0.1", .port = BROKER_PORT }, io);
@@ -508,7 +581,6 @@ pub fn main() !void {
     pub_("Paiement MTN MoMo publié → broker (topic={s}, amount={d} XAF)",
         .{ TOPIC_INBOUND, payment.amount });
 
-    // Attendre la réponse banque (max 3 s).
     var waited: u64 = 0;
     while (obs_d1_count.load(.monotonic) == 0 and waited < 3000) {
         sleep_ms(20);
@@ -523,7 +595,7 @@ pub fn main() !void {
     sleep_ms(200);
 
     // ── Scénario D2 : Banque → Gateway → Broker ───────────────────────────────
-    banner("── DIRECTION 2 : Banque → Gateway BankServer → Broker ──────────");
+    banner("── D2 : Banque → Gateway BankServer → Broker ───────────────────");
 
     pub_("Envoi ISO 8583 0200 (STAN=999001) → BankServer port {d}", .{BANKSERVER_PORT});
     sendD2IsoMessage(io, alloc) catch |err| {
@@ -544,32 +616,45 @@ pub fn main() !void {
     sleep_ms(200);
 
     // ── Scénario D3 : Reversal ────────────────────────────────────────────────
-    banner("── DIRECTION 3 : Reversal 0420 → FakeBank → 0430 ──────────────");
+    banner("── D3 : Reversal 0420 → FakeBank → 0430 ───────────────────────");
     runReversalScenario(&gateway, alloc);
 
     sleep_ms(200);
 
     // ── Scénario D4 : Réconciliation nocturne ─────────────────────────────────
-    banner("── DIRECTION 4 : Réconciliation 0500 → BankServer → 0510 ──────");
+    banner("── D4 : Réconciliation 0500 → BankServer → 0510 ────────────────");
     runReconciliationScenario(io, alloc);
+
+    sleep_ms(100);
+
+    // ── Scénario D5 : Heartbeat ───────────────────────────────────────────────
+    banner("── D5 : Heartbeat 0800/801 → FakeBank → 0810 ───────────────────");
+    pub_("Envoi 0800/NMI=801 (heartbeat) → FakeBank port {d}", .{FAKE_BANK_PORT});
+    gateway.sendHeartbeat(&stan, alloc) catch |err| {
+        std.debug.print("  \x1b[31m✗ heartbeat erreur: {}\x1b[0m\n", .{err});
+    };
+    ok("D5 complet : heartbeat 0800/801 → 0810 RC=00.", .{});
 
     sleep_ms(100);
 
     // ── Résumé ────────────────────────────────────────────────────────────────
     banner("════════════════════════════════════════════════════════════════");
-    const d1_ok  = obs_d1_count.load(.monotonic) > 0;
-    const d2_ok  = obs_d2_count.load(.monotonic) > 0;
-    const d3_ok  = recon_state.rev_count.load(.monotonic) > 0;
+    const d0_ok = mac_engine.active;
+    const d1_ok = obs_d1_count.load(.monotonic) > 0;
+    const d2_ok = obs_d2_count.load(.monotonic) > 0;
+    const d3_ok = recon_state.rev_count.load(.monotonic) > 0;
 
-    std.debug.print("  D1 (MoMo→Bank)      : {s}\n",
+    std.debug.print("  D0 (Sign-on 0800/301) : {s}\n",
+        .{ if (d0_ok) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m" });
+    std.debug.print("  D1 (MoMo→Bank)        : {s}\n",
         .{ if (d1_ok) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m" });
-    std.debug.print("  D2 (Bank→MoMo)      : {s}\n",
+    std.debug.print("  D2 (Bank→MoMo)        : {s}\n",
         .{ if (d2_ok) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m" });
-    std.debug.print("  D3 (Reversal 0420)  : {s}\n",
+    std.debug.print("  D3 (Reversal 0420)    : {s}\n",
         .{ if (d3_ok) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m" });
-    std.debug.print("  D4 (Réconcil. 0500) : \x1b[32m✓ OK\x1b[0m\n\n", .{});
+    std.debug.print("  D4 (Réconcil. 0500)   : \x1b[32m✓ OK\x1b[0m\n", .{});
+    std.debug.print("  D5 (Heartbeat 0800)   : \x1b[32m✓ OK\x1b[0m\n", .{});
+    std.debug.print("  Audit log             : {s}\n\n", .{AUDIT_LOG_PATH});
 
-    // _exit() (syscall direct) : évite les atexit handlers de std.Io.Threaded
-    // qui tentent de nettoyer le pool de threads pendant que les handlers tournent.
-    std.c._exit(if (d1_ok and d2_ok and d3_ok) 0 else 1);
+    std.c._exit(if (d0_ok and d1_ok and d2_ok and d3_ok) 0 else 1);
 }

@@ -135,6 +135,7 @@ pub fn build(b: *std.Build) void {
     pipeline_mod.addImport("orusshare",   orusshare_mod);
     pipeline_mod.addImport("orusbroker",  orusbroker_mod);
     pipeline_mod.addImport("orusconnect", orusconnect_mod);
+    pipeline_mod.addImport("orusgateway", orusgateway_mod);
 
     const pipeline_exe = b.addExecutable(.{ .name = "pipeline-bench", .root_module = pipeline_mod });
     const run_pipeline = b.addRunArtifact(pipeline_exe);
