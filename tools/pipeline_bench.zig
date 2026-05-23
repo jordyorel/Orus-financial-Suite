@@ -41,9 +41,18 @@ const LAT_CAP = 2000;
 var g_lat:    [LAT_CAP]u64 = undefined;
 var g_lat_idx = std.atomic.Value(usize).init(0);
 var g_p50_us  = std.atomic.Value(u64).init(0);
+var g_p95_us  = std.atomic.Value(u64).init(0);
 var g_p99_us  = std.atomic.Value(u64).init(0);
 
 var g_stopped = std.atomic.Value(bool).init(false);
+
+// FakeBank MAC engine — mirrors the Gateway's session key so responses carry
+// a valid F64 that the Gateway's MacEngine can verify.
+var fake_mac_engine = gw_mod.MacEngine.init();
+
+// Protects g_lat writes (onMsg) and the memcpy in the ticker.
+// Critical section is ≤ 1 store (write) or ≤ 16 KB memcpy (ticker, 1×/s).
+var g_lat_mu: std.atomic.Mutex = .unlocked;
 
 fn sigHandler(sig: std.c.SIG) callconv(.c) void {
     _ = sig;
@@ -121,6 +130,11 @@ fn replyMti(conn: FakeBankConn, alloc: std.mem.Allocator, mti: [4]u8, stan: []co
     try resp.set(39, "00");
     try resp.set(11, stan);
     try resp.set(49, "XAF");
+    // MAC scope = response without F64 (same convention as Gateway outbound).
+    const scope = try gw_mod.iso8583.serialize(&resp, alloc);
+    defer alloc.free(scope);
+    const mac_val = fake_mac_engine.compute(scope);
+    try resp.set(64, &mac_val);
     const bytes = try gw_mod.iso8583.serializeWithSchema(&resp, &gw_mod.DEFAULT_SCHEMA, alloc);
     defer alloc.free(bytes);
     var wbuf: [4096]u8 = undefined;
@@ -219,8 +233,10 @@ fn onMsg(msg: *const orusshare.InternalMessage, raw_ctx: ?*anyopaque) void {
     const now_ns: i64 = ts.sec *% std.time.ns_per_s + ts.nsec;
     if (msg.received_at > 0 and now_ns > msg.received_at) {
         const lat: u64 = @intCast(now_ns - msg.received_at);
+        while (!g_lat_mu.tryLock()) std.atomic.spinLoopHint();
         const idx = g_lat_idx.fetchAdd(1, .monotonic) % LAT_CAP;
         g_lat[idx] = lat;
+        g_lat_mu.unlock();
     }
     const is_rev = std.mem.eql(u8, &msg.mti, "0420") or std.mem.eql(u8, &msg.mti, "0421");
     if (is_rev) {
@@ -334,14 +350,18 @@ fn ticker(args: TickerArgs) void {
         // Percentiles de latence — calculés avant le seqlock, stockés dedans
         // pour que le handler HTTP lise toujours P50 et P99 de la même fenêtre.
         var p50_val: u64 = 0;
+        var p95_val: u64 = 0;
         var p99_val: u64 = 0;
         const n_raw = g_lat_idx.load(.monotonic);
         const n = @min(n_raw, LAT_CAP);
         if (n > 1) {
             var tmp: [LAT_CAP]u64 = undefined;
+            while (!g_lat_mu.tryLock()) std.atomic.spinLoopHint();
             @memcpy(tmp[0..n], g_lat[0..n]);
+            g_lat_mu.unlock();
             std.mem.sort(u64, tmp[0..n], {}, std.sort.asc(u64));
             p50_val = tmp[n / 2] / 1000;
+            p95_val = tmp[n * 95 / 100] / 1000;
             p99_val = tmp[n * 99 / 100] / 1000;
         }
 
@@ -370,6 +390,7 @@ fn ticker(args: TickerArgs) void {
         // Stocker P50/P99 à l'intérieur du seqlock : le reader HTTP
         // verra toujours une paire (P50, P99) cohérente (même fenêtre).
         g_p50_us.store(p50_val, .monotonic);
+        g_p95_us.store(p95_val, .monotonic);
         g_p99_us.store(p99_val, .monotonic);
         _ = g_hist_gen.fetchAdd(1, .release);
 
@@ -432,6 +453,7 @@ fn serveJson(stream: std.Io.net.Stream, io: std.Io, wal_path: []const u8) void {
     var hgw:  [60]u64 = undefined;
     var hn:     usize = 0;
     var p50_snap: u64 = 0;
+    var p95_snap: u64 = 0;
     var p99_snap: u64 = 0;
     while (true) {
         const gen1 = g_hist_gen.load(.acquire);
@@ -445,9 +467,8 @@ fn serveJson(stream: std.Io.net.Stream, io: std.Io, wal_path: []const u8) void {
             hrev[i] = g_hist_rev[idx];
             hgw[i]  = g_hist_gw[idx];
         }
-        // Lire P50/P99 dans la même section protégée : garantit que
-        // les deux valeurs proviennent de la même fenêtre de tri.
         p50_snap = g_p50_us.load(.monotonic);
+        p95_snap = g_p95_us.load(.monotonic);
         p99_snap = g_p99_us.load(.monotonic);
         const gen2 = g_hist_gen.load(.acquire);
         if (gen1 == gen2) break;
@@ -577,18 +598,18 @@ fn printRecap(wal_path: []const u8, io: std.Io) void {
     const errors = g_pub_errors.load(.monotonic);
     const hbs    = g_heartbeats.load(.monotonic);
 
+    // Use the seqlock-protected atomics computed by the ticker — reading
+    // g_lat directly here would race with live subscriber threads still
+    // writing to it, producing impossible P50 > P95 results.
+    const p50  = g_p50_us.load(.monotonic);
+    const p95  = g_p95_us.load(.monotonic);
+    const p99  = g_p99_us.load(.monotonic);
+    var pmax: u64 = 0;
     const n_raw = g_lat_idx.load(.monotonic);
     const n = @min(n_raw, LAT_CAP);
-    var p50: u64 = 0; var p95: u64 = 0; var p99: u64 = 0; var pmax: u64 = 0;
-    if (n > 1) {
-        var tmp: [LAT_CAP]u64 = undefined;
-        @memcpy(tmp[0..n], g_lat[0..n]);
-        std.mem.sort(u64, tmp[0..n], {}, std.sort.asc(u64));
-        p50  = tmp[n / 2]        / 1000;
-        p95  = tmp[n * 95 / 100] / 1000;
-        p99  = tmp[n * 99 / 100] / 1000;
-        pmax = tmp[n - 1]        / 1000;
-    }
+    while (!g_lat_mu.tryLock()) std.atomic.spinLoopHint();
+    for (g_lat[0..n]) |v| if (v / 1000 > pmax) { pmax = v / 1000; };
+    g_lat_mu.unlock();
 
     const wal_stat = std.Io.Dir.cwd().statFile(io, wal_path, .{}) catch null;
     const wal_mb: f64 = if (wal_stat) |st|
@@ -795,6 +816,9 @@ pub fn main() !void {
     _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 80_000_000 }, null);
 
     // ── FakeBank ──────────────────────────────────────────────────────────────
+    // Activate the FakeBank MAC engine with the same key it delivers in F96
+    // at sign-on, so its responses carry a valid F64 the Gateway can verify.
+    fake_mac_engine.setKey(FAKE_SESSION_KEY);
     const bank_addr = try std.Io.net.IpAddress.parse("127.0.0.1", FAKE_BANK_PORT);
     var bank_server_sock = try bank_addr.listen(io, .{ .reuse_address = true });
     var fake_bank_args = FakeBankArgs{ .server = &bank_server_sock, .io = io };

@@ -142,6 +142,21 @@ pub fn build(b: *std.Build) void {
     const pipeline_step = b.step("pipeline", "Pipeline live avec dashboard web (http://localhost:7780)");
     pipeline_step.dependOn(&run_pipeline.step);
 
+    const battle_sim_mod = b.addModule("battle-test", .{
+        .root_source_file = b.path("tools/battle_test.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    battle_sim_mod.addImport("orusshare",   orusshare_mod);
+    battle_sim_mod.addImport("orusbroker",  orusbroker_mod);
+    battle_sim_mod.addImport("orusconnect", orusconnect_mod);
+    battle_sim_mod.addImport("orusgateway", orusgateway_mod);
+
+    const battle_sim_exe = b.addExecutable(.{ .name = "battle-test", .root_module = battle_sim_mod });
+    const run_battle_sim = b.addRunArtifact(battle_sim_exe);
+    const battle_sim_step = b.step("battle", "Chaos battle test avec dashboard (http://localhost:7782)");
+    battle_sim_step.dependOn(&run_battle_sim.step);
+
     const bench_mod = b.addModule("benchmark", .{
         .root_source_file = b.path("tools/benchmark.zig"),
         .target = target,

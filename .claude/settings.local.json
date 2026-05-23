@@ -62,7 +62,22 @@
       "Bash(.zig-cache/o/e6ceb6522cd724911be0148ca00e70a2/test)",
       "Bash(echo \"Exit: $?\")",
       "Bash(./zig-cache/bin/demo-full)",
-      "Bash(/opt/homebrew/Cellar/zig/0.16.0/bin/zig build *)"
+      "Bash(/opt/homebrew/Cellar/zig/0.16.0/bin/zig build *)",
+      "Bash(pkill -9 battle-test)",
+      "Bash(curl -sv http://127.0.0.1:7782/)",
+      "Bash(netstat -anp tcp)",
+      "Bash(ping -c1 127.0.0.1)",
+      "Bash(pkill -9 \"pipeline-bench\")",
+      "Bash(echo \"BUILD_EXIT:$?\")",
+      "Bash(echo \"PID:$!\")",
+      "Bash(curl -s http://127.0.0.1:7782/metrics)",
+      "Bash(jobs -l)",
+      "Bash(pkill -9 \"zig build\")",
+      "Bash(grep -E \"battle-test$\")",
+      "Bash(lsof -ti:7782)",
+      "Bash(xargs kill -9)",
+      "Bash(echo \"build started in background \\(PID $!\\)\")",
+      "Bash(curl -s http://127.0.0.1:7782/)"
     ]
   }
 }
