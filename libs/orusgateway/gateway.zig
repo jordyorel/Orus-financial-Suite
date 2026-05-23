@@ -2,17 +2,20 @@ const std = @import("std");
 const orusshare = @import("orusshare");
 const translator = @import("translator.zig");
 const bank_client_mod = @import("bank_client.zig");
+const reconciliation_mod = @import("reconciliation.zig");
 const parser = @import("iso8583/parser.zig");
 
 pub const InternalMessage = orusshare.InternalMessage;
 pub const BankClient = bank_client_mod.BankClient;
 pub const BankClientError = bank_client_mod.BankClientError;
+pub const ReconciliationState = reconciliation_mod.ReconciliationState;
 
 pub const GatewayError = translator.TranslateError || BankClientError;
 
 pub const Gateway = struct {
     bank: BankClient,
     pan_hash_seed: u64,
+    reconciliation: ?*ReconciliationState = null,
 
     pub fn init(bank: BankClient, pan_hash_seed: u64) Gateway {
         return .{ .bank = bank, .pan_hash_seed = pan_hash_seed };
@@ -34,14 +37,30 @@ pub const Gateway = struct {
         var iso_resp = try self.bank.send(&iso_req, alloc);
         defer iso_resp.deinit();
 
-        // The response inherits identity from the request.
-        // origin and hop_count are updated to reflect the bank leg.
         var base = req.*;
         base.origin = .iso8583;
-        base.hop_count +|= 1; // saturating: never wraps past 255
+        base.hop_count +|= 1;
         base.received_at = @intCast(std.Io.Clock.real.now(self.bank.io).nanoseconds);
 
-        return translator.toInternal(&iso_resp, base, alloc, self.pan_hash_seed);
+        const result = try translator.toInternal(&iso_resp, base, alloc, self.pan_hash_seed);
+        if (self.reconciliation) |r| r.record(&result);
+        return result;
+    }
+
+    // Send a reversal for an approved payment.
+    // Builds MTI 0420 (or 0421) from `original`, sends it to the bank, returns the 0430 response.
+    // Use when the MoMo callback was never delivered after a bank approval.
+    pub fn processReversal(
+        self: *const Gateway,
+        original: *const InternalMessage,
+        alloc: std.mem.Allocator,
+    ) GatewayError!InternalMessage {
+        var rev = try translator.buildReversal(original, alloc);
+        defer {
+            for (rev.fields) |f| alloc.free(f.value);
+            alloc.free(rev.fields);
+        }
+        return self.process(&rev, alloc);
     }
 };
 

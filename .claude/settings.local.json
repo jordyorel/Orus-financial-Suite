@@ -50,7 +50,15 @@
       "Bash(xxd /tmp/demo_pipeline.wal)",
       "Bash(xxd /tmp/bench_broker.wal)",
       "Bash(sysctl *)",
-      "Bash(BENCH_PUB_THREADS=2 BENCH_DURATION=30 BENCH_DECLINE_RATE=0 zig build *)"
+      "Bash(BENCH_PUB_THREADS=2 BENCH_DURATION=30 BENCH_DECLINE_RATE=0 zig build *)",
+      "Bash(curl -s http://localhost:7780/metrics)",
+      "Bash(kill %1)",
+      "Bash(wait)",
+      "Bash(curl -s http://localhost:7780/)",
+      "Bash(xargs ls -la)",
+      "Bash(pkill -INT -f \"zig-out/bin/pipeline\")",
+      "Bash(pkill -INT -f \"pipeline_bench\")",
+      "Bash(pkill -INT -f \"pipeline\")"
     ]
   }
 }

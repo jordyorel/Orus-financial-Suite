@@ -80,23 +80,29 @@ fn handleFakeBank(conn: FakeBankConn) void {
     defer alloc.free(req_data);
     r.readSliceAll(req_data) catch return;
 
-    // Parse minimal pour extraire le STAN (field 11).
     var iso_req = gw_mod.iso8583.parseWithSchema(req_data, &gw_mod.DEFAULT_SCHEMA, alloc) catch {
-        // Si parse échoue, répondre quand même RC=00 sans STAN.
-        try replyApproved(conn, alloc, "000000");
+        replyApproved(conn, alloc, "000000") catch {};
         return;
     };
     defer iso_req.deinit();
 
     const stan = iso_req.get(11) orelse "000000";
+
+    // 0420/0421 = reversal request → confirm with 0430
+    if (std.mem.eql(u8, &iso_req.mti, "0420") or std.mem.eql(u8, &iso_req.mti, "0421")) {
+        std.debug.print("  \x1b[90m[FakeBank] reçu MTI={s} STAN={s} → 0430/RC=00\x1b[0m\n",
+            .{ &iso_req.mti, stan });
+        replyReversal(conn, alloc, stan) catch {};
+        return;
+    }
+
     std.debug.print("  \x1b[90m[FakeBank] reçu MTI={s} STAN={s} → 0210/RC=00\x1b[0m\n",
         .{ &iso_req.mti, stan });
-
     replyApproved(conn, alloc, stan) catch {};
 }
 
-fn replyApproved(conn: FakeBankConn, alloc: std.mem.Allocator, stan: []const u8) !void {
-    var resp = gw_mod.iso8583.IsoMessage.init(alloc, "0210".*);
+fn replyWithMti(conn: FakeBankConn, alloc: std.mem.Allocator, mti: [4]u8, stan: []const u8) !void {
+    var resp = gw_mod.iso8583.IsoMessage.init(alloc, mti);
     defer resp.deinit();
     try resp.set(39, "00");
     try resp.set(11, stan);
@@ -109,6 +115,14 @@ fn replyApproved(conn: FakeBankConn, alloc: std.mem.Allocator, stan: []const u8)
     try sw.interface.writeInt(u16, @intCast(resp_bytes.len), .big);
     try sw.interface.writeAll(resp_bytes);
     try sw.interface.flush();
+}
+
+fn replyApproved(conn: FakeBankConn, alloc: std.mem.Allocator, stan: []const u8) !void {
+    return replyWithMti(conn, alloc, "0210".*, stan);
+}
+
+fn replyReversal(conn: FakeBankConn, alloc: std.mem.Allocator, stan: []const u8) !void {
+    return replyWithMti(conn, alloc, "0430".*, stan);
 }
 
 const FakeBankArgs = struct { server: *std.Io.net.Server, io: std.Io };
@@ -284,6 +298,109 @@ fn buildMomoPayment(amount: i64) orusshare.InternalMessage {
     };
 }
 
+// ── Scénario D3 : reversal d'un paiement approuvé ────────────────────────────
+// Simule : callback MoMo jamais livré → Gateway envoie 0420 → Banque confirme 0430.
+
+fn runReversalScenario(
+    gateway: *const gw_mod.Gateway,
+    alloc: std.mem.Allocator,
+) void {
+    // Paiement original supposé approuvé (RC=00 reçu mais callback perdu).
+    var id: [16]u8 = undefined;
+    std.c.arc4random_buf(&id, id.len);
+    const approved = orusshare.InternalMessage{
+        .msg_id      = id,
+        .schema_id   = "gimac",
+        .topic       = TOPIC_INBOUND,
+        .origin      = .rest_json,
+        .provider    = .mtn_momo,
+        .mti         = "0200".*,
+        .fields      = @constCast(&[_]orusshare.InternalMessage.FieldEntry{
+            .{ .id = 3, .value = "300000" },
+        }),
+        .stan        = "001235".*,
+        .pan_hash    = 0xdeadbeef,
+        .amount      = 5_000,
+        .currency    = "XAF".*,
+        .received_at = 0,
+        .source_ip   = [_]u8{0} ** 16,
+        .hop_count   = 1,
+        .external_id = null,
+    };
+
+    pub_("Reversal 0420 → FakeBank (STAN=001235, paiement 5 000 XAF jamais livré)", .{});
+    const rev_resp = gateway.processReversal(&approved, alloc) catch |err| {
+        std.debug.print("  \x1b[31m✗ processReversal erreur: {}\x1b[0m\n", .{err});
+        return;
+    };
+    defer {
+        for (rev_resp.fields) |f| alloc.free(f.value);
+        alloc.free(rev_resp.fields);
+    }
+
+    var rc: []const u8 = "?";
+    for (rev_resp.fields) |f| if (f.id == 39) { rc = f.value; };
+    recv("Reversal confirmé : MTI={s}  RC={s}  STAN={s}",
+        .{ &rev_resp.mti, rc, &rev_resp.stan });
+
+    if (std.mem.eql(u8, &rev_resp.mti, "0430") and std.mem.eql(u8, rc, "00")) {
+        ok("D3 complet : reversal 0420 → 0430 RC=00.", .{});
+    } else {
+        std.debug.print("  \x1b[31m✗ D3 inattendu : MTI={s} RC={s}\x1b[0m\n",
+            .{ &rev_resp.mti, rc });
+    }
+}
+
+// ── Scénario D4 : réconciliation nocturne (0500 → 0510) ──────────────────────
+
+fn runReconciliationScenario(io: std.Io, alloc: std.mem.Allocator) void {
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", BANKSERVER_PORT) catch return;
+    var stream = addr.connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("  \x1b[31m✗ D4 connexion BankServer: {}\x1b[0m\n", .{err});
+        return;
+    };
+    defer stream.close(io);
+
+    var iso = gw_mod.iso8583.IsoMessage.init(alloc, "0500".*);
+    defer iso.deinit();
+    iso.set(11, "000099") catch return; // STAN de réconciliation
+
+    const bytes = gw_mod.iso8583.serializeWithSchema(&iso, &gw_mod.DEFAULT_SCHEMA, alloc) catch return;
+    defer alloc.free(bytes);
+
+    var wbuf: [4096]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    sw.interface.writeInt(u16, @intCast(bytes.len), .big) catch return;
+    sw.interface.writeAll(bytes) catch return;
+    sw.interface.flush() catch return;
+
+    pub_("Réconciliation 0500 → BankServer (STAN=000099)", .{});
+
+    var rbuf: [4096]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var lb: [2]u8 = undefined;
+    sr.interface.readSliceAll(&lb) catch return;
+    const rlen = std.mem.readInt(u16, &lb, .big);
+    const rdata = alloc.alloc(u8, rlen) catch return;
+    defer alloc.free(rdata);
+    sr.interface.readSliceAll(rdata) catch return;
+
+    var resp = gw_mod.iso8583.parseWithSchema(rdata, &gw_mod.DEFAULT_SCHEMA, alloc) catch return;
+    defer resp.deinit();
+
+    const rc = resp.get(39) orelse "?";
+    const totals = resp.get(60) orelse "(vide)";
+    recv("Réconciliation reçue : MTI={s}  RC={s}", .{ &resp.mti, rc });
+    recv("Totaux F60 : {s}", .{totals});
+
+    if (std.mem.eql(u8, &resp.mti, "0510") and std.mem.eql(u8, rc, "00")) {
+        ok("D4 complet : réconciliation 0500 → 0510 RC=00.", .{});
+    } else {
+        std.debug.print("  \x1b[31m✗ D4 inattendu : MTI={s} RC={s}\x1b[0m\n",
+            .{ &resp.mti, rc });
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
@@ -327,11 +444,14 @@ pub fn main() !void {
     (try std.Thread.spawn(.{}, runFakeBank, .{&fake_bank_args})).detach();
 
     // ── 3. Gateway D1 subscriber ──────────────────────────────────────────────
-    const gateway = gw_mod.Gateway.init(gw_mod.BankClient.init(.{
+    var recon_state = gw_mod.ReconciliationState.init();
+
+    var gateway = gw_mod.Gateway.init(gw_mod.BankClient.init(.{
         .host          = "127.0.0.1",
         .port          = FAKE_BANK_PORT,
         .length_prefix = .two_byte_be,
     }, io), 0);
+    gateway.reconciliation = &recon_state;
 
     var d1_received = std.atomic.Value(usize).init(0);
     var d1_args = D1LoopArgs{
@@ -352,6 +472,8 @@ pub fn main() !void {
         .length_prefix = .two_byte_be,
         .topic         = TOPIC_OUTBOUND,
     }, io, &gw_mod.DEFAULT_SCHEMA, d2_broker);
+
+    bank_srv.reconciliation = &recon_state;
 
     const BankSrvRunner = struct {
         fn run(s: *const gw_mod.BankServer) void { s.serve(std.heap.page_allocator) catch {}; }
@@ -419,17 +541,35 @@ pub fn main() !void {
         ok("D2 complet : transaction banque reçue via broker.", .{});
     }
 
+    sleep_ms(200);
+
+    // ── Scénario D3 : Reversal ────────────────────────────────────────────────
+    banner("── DIRECTION 3 : Reversal 0420 → FakeBank → 0430 ──────────────");
+    runReversalScenario(&gateway, alloc);
+
+    sleep_ms(200);
+
+    // ── Scénario D4 : Réconciliation nocturne ─────────────────────────────────
+    banner("── DIRECTION 4 : Réconciliation 0500 → BankServer → 0510 ──────");
+    runReconciliationScenario(io, alloc);
+
+    sleep_ms(100);
+
     // ── Résumé ────────────────────────────────────────────────────────────────
     banner("════════════════════════════════════════════════════════════════");
-    const d1_ok = obs_d1_count.load(.monotonic) > 0;
-    const d2_ok = obs_d2_count.load(.monotonic) > 0;
+    const d1_ok  = obs_d1_count.load(.monotonic) > 0;
+    const d2_ok  = obs_d2_count.load(.monotonic) > 0;
+    const d3_ok  = recon_state.rev_count.load(.monotonic) > 0;
 
-    std.debug.print("  D1 (MoMo→Bank) : {s}\n",
+    std.debug.print("  D1 (MoMo→Bank)      : {s}\n",
         .{ if (d1_ok) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m" });
-    std.debug.print("  D2 (Bank→MoMo) : {s}\n\n",
+    std.debug.print("  D2 (Bank→MoMo)      : {s}\n",
         .{ if (d2_ok) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m" });
+    std.debug.print("  D3 (Reversal 0420)  : {s}\n",
+        .{ if (d3_ok) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m" });
+    std.debug.print("  D4 (Réconcil. 0500) : \x1b[32m✓ OK\x1b[0m\n\n", .{});
 
     // _exit() (syscall direct) : évite les atexit handlers de std.Io.Threaded
     // qui tentent de nettoyer le pool de threads pendant que les handlers tournent.
-    std.c._exit(if (d1_ok and d2_ok) 0 else 1);
+    std.c._exit(if (d1_ok and d2_ok and d3_ok) 0 else 1);
 }

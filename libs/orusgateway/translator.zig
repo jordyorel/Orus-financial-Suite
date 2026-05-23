@@ -92,6 +92,44 @@ pub fn toInternal(
     return msg;
 }
 
+// ── MTI helpers ───────────────────────────────────────────────────────────────
+
+pub fn isReversal(mti: [4]u8) bool {
+    return std.mem.eql(u8, &mti, "0420") or
+           std.mem.eql(u8, &mti, "0421") or
+           std.mem.eql(u8, &mti, "0430");
+}
+
+pub fn isReconciliation(mti: [4]u8) bool {
+    return std.mem.eql(u8, &mti, "0500") or
+           std.mem.eql(u8, &mti, "0510");
+}
+
+// Build a reversal InternalMessage from an approved payment.
+// MTI mapping: 0200 → 0420, 0201 → 0421, anything else → 0420.
+// Caller frees result.fields the same way as toInternal():
+//   for (result.fields) |f| alloc.free(f.value);
+//   alloc.free(result.fields);
+pub fn buildReversal(
+    original: *const InternalMessage,
+    alloc: std.mem.Allocator,
+) TranslateError!InternalMessage {
+    var rev = original.*;
+    rev.mti = if (std.mem.eql(u8, &original.mti, "0201")) "0421".* else "0420".*;
+
+    var entries: std.ArrayList(InternalMessage.FieldEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| alloc.free(e.value);
+        entries.deinit(alloc);
+    }
+    for (original.fields) |f| {
+        const duped = try alloc.dupe(u8, f.value);
+        entries.append(alloc, .{ .id = f.id, .value = duped }) catch return error.OutOfMemory;
+    }
+    rev.fields = try entries.toOwnedSlice(alloc);
+    return rev;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "fromInternal: top-level fields map to ISO fields" {

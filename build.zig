@@ -127,6 +127,20 @@ pub fn build(b: *std.Build) void {
     const full_demo_step = b.step("demo-full", "Démonstration pipeline complet D1+D2");
     full_demo_step.dependOn(&run_full_demo.step);
 
+    const pipeline_mod = b.addModule("pipeline-bench", .{
+        .root_source_file = b.path("tools/pipeline_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    pipeline_mod.addImport("orusshare",   orusshare_mod);
+    pipeline_mod.addImport("orusbroker",  orusbroker_mod);
+    pipeline_mod.addImport("orusconnect", orusconnect_mod);
+
+    const pipeline_exe = b.addExecutable(.{ .name = "pipeline-bench", .root_module = pipeline_mod });
+    const run_pipeline = b.addRunArtifact(pipeline_exe);
+    const pipeline_step = b.step("pipeline", "Pipeline live avec dashboard web (http://localhost:7780)");
+    pipeline_step.dependOn(&run_pipeline.step);
+
     const bench_mod = b.addModule("benchmark", .{
         .root_source_file = b.path("tools/benchmark.zig"),
         .target = target,

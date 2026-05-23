@@ -5,6 +5,7 @@ const translator = @import("translator.zig");
 const schema_mod = @import("iso8583/schema.zig");
 const bank_client_mod = @import("bank_client.zig");
 const broker_mod = @import("broker_client.zig");
+const reconciliation_mod = @import("reconciliation.zig");
 
 // BankServer — Direction 2 (Banque → MoMo).
 //
@@ -24,7 +25,6 @@ pub const Config = struct {
     host: []const u8,
     port: u16,
     length_prefix: bank_client_mod.LengthPrefix = .two_byte_be,
-    // OrusBroker topic to publish received transactions on.
     topic: []const u8 = "transactions.outbound",
 };
 
@@ -34,6 +34,7 @@ pub const BankServer = struct {
     schema: *const schema_mod.IsoSchema,
     broker: broker_mod.BrokerClient,
     pan_hash_seed: u64 = 0,
+    reconciliation: ?*reconciliation_mod.ReconciliationState = null,
 
     pub fn init(
         config: Config,
@@ -117,6 +118,23 @@ fn handleConn(ctx: *ConnCtx) void {
     };
     defer iso_msg.deinit();
 
+    // ── Reconciliation request (0500) → respond 0510 immediately ─────────────
+    if (std.mem.eql(u8, &iso_msg.mti, "0500")) {
+        const rec = s.reconciliation orelse {
+            std.log.warn("bank_server: received 0500 but no ReconciliationState configured", .{});
+            return;
+        };
+        var resp_iso = rec.buildResponse(&iso_msg, alloc) catch return;
+        defer resp_iso.deinit();
+        const resp_bytes = parser.serializeWithSchema(&resp_iso, s.schema, alloc) catch return;
+        defer alloc.free(resp_bytes);
+        writeLenPrefix(w, resp_bytes.len, s.config.length_prefix) catch return;
+        w.writeAll(resp_bytes) catch return;
+        w.flush() catch return;
+        std.log.info("bank_server: reconciliation 0500 → 0510 sent", .{});
+        return;
+    }
+
     // ── toInternal ────────────────────────────────────────────────────────────
     var msg_id: [16]u8 = undefined;
     std.c.arc4random_buf(&msg_id, msg_id.len);
@@ -148,6 +166,9 @@ fn handleConn(ctx: *ConnCtx) void {
         for (im.fields) |f| alloc.free(f.value);
         alloc.free(im.fields);
     }
+
+    // ── Record for reconciliation ─────────────────────────────────────────────
+    if (s.reconciliation) |rec| rec.record(&im);
 
     // ── Publish to broker ──────────────────────────────────────────────────────
     s.broker.publish(&im, alloc) catch |err| {

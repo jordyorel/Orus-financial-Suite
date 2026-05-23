@@ -36,8 +36,9 @@ fn buildSpecs() [129]?FieldSpec {
     s[42] = .{ .kind = .fixed,  .len = 15  }; // Card Acceptor ID Code
     s[43] = .{ .kind = .fixed,  .len = 40  }; // Card Acceptor Name/Location
     s[49] = .{ .kind = .fixed,  .len = 3   }; // Currency Code
-    s[102] = .{ .kind = .llvar, .len = 28  }; // Account Identification 1
-    s[103] = .{ .kind = .llvar, .len = 28  }; // Account Identification 2
+    s[60]  = .{ .kind = .lllvar, .len = 120 }; // Reconciliation totals (advisory)
+    s[102] = .{ .kind = .llvar,  .len = 28  }; // Account Identification 1
+    s[103] = .{ .kind = .llvar,  .len = 28  }; // Account Identification 2
 
     return s;
 }
