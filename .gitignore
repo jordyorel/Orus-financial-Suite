@@ -3,4 +3,4 @@ zig-out/
 *.o
 *.a
 .DS_Store
-.claude
+.claude/
