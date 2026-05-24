@@ -10,30 +10,50 @@
 //   N  = sync every N writes (at most N-1 records lost on crash)
 //   0  = no sync (bench/test only — not suitable for production)
 // The newline acts as a commit marker; an incomplete last line is ignored by parsers.
+//
+// Performance: record() formats the line on the caller's stack, then acquires the
+// mutex only for a memcpy into the internal 64 KB write buffer.  The mutex hold
+// time is O(line length) — nanoseconds — instead of a write() syscall.  The
+// buffer is flushed to disk only when full or at a sync boundary (sync_every > 0).
 
 const std = @import("std");
 
 pub const AuditLog = struct {
     file:        std.Io.File,
     io:          std.Io,
-    mu:          std.atomic.Mutex,
-    offset:      u64,
+    mu:          std.c.pthread_mutex_t,
+    file_offset: u64,
     write_count: u64,
     // 1 = compliance default; set higher for benchmarks.
     sync_every:  u64,
+    buf:         [65536]u8,
+    buf_used:    usize,
 
     pub fn open(io: std.Io, path: []const u8) !AuditLog {
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
         const size = std.Io.File.length(file, io) catch 0;
         return .{
             .file = file, .io = io,
-            .mu = .unlocked, .offset = size, .write_count = 0, .sync_every = 1,
+            .mu = .{},
+            .file_offset = size, .write_count = 0, .sync_every = 1,
+            .buf = undefined, .buf_used = 0,
         };
     }
 
     pub fn close(self: *AuditLog) void {
+        _ = std.c.pthread_mutex_lock(&self.mu);
+        self.flushNoLock();
         std.Io.File.sync(self.file, self.io) catch {};
+        _ = std.c.pthread_mutex_unlock(&self.mu);
         std.Io.File.close(self.file, self.io);
+    }
+
+    // Caller must hold self.mu.
+    fn flushNoLock(self: *AuditLog) void {
+        if (self.buf_used == 0) return;
+        std.Io.File.writePositionalAll(self.file, self.io, self.buf[0..self.buf_used], self.file_offset) catch return;
+        self.file_offset += self.buf_used;
+        self.buf_used = 0;
     }
 
     // Record one financial event. Thread-safe. Best-effort: errors are silently
@@ -48,6 +68,7 @@ pub const AuditLog = struct {
         provider: []const u8,
         msg_id:   [16]u8,
     ) void {
+        // Format the line on the caller's stack — no lock needed.
         var ts: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.REALTIME, &ts);
 
@@ -58,9 +79,9 @@ pub const AuditLog = struct {
             hex_id[i * 2 + 1] = hex_chars[b & 0xf];
         }
 
-        var buf: [512]u8 = undefined;
+        var line_buf: [512]u8 = undefined;
         const nsec: u64 = @intCast(ts.nsec);
-        const line = std.fmt.bufPrint(&buf,
+        const line = std.fmt.bufPrint(&line_buf,
             "{d}.{d:0>9}\t{s}\t{s}\t{d}\t{s}\t{s}\t{s}\t{s}\n",
             .{
                 ts.sec, nsec,
@@ -69,14 +90,21 @@ pub const AuditLog = struct {
             },
         ) catch return;
 
-        while (!self.mu.tryLock()) std.atomic.spinLoopHint();
-        defer self.mu.unlock();
+        // Acquire lock — hold only for memcpy (nanoseconds in the common case).
+        _ = std.c.pthread_mutex_lock(&self.mu);
+        defer _ = std.c.pthread_mutex_unlock(&self.mu);
 
-        std.Io.File.writePositionalAll(self.file, self.io, line, self.offset) catch return;
-        self.offset      += line.len;
+        // Flush buffer to disk if the new line would overflow it.
+        if (self.buf_used + line.len > self.buf.len) self.flushNoLock();
+
+        @memcpy(self.buf[self.buf_used..][0..line.len], line);
+        self.buf_used    += line.len;
         self.write_count += 1;
-        if (self.sync_every > 0 and self.write_count % self.sync_every == 0)
+
+        if (self.sync_every > 0 and self.write_count % self.sync_every == 0) {
+            self.flushNoLock();
             std.Io.File.sync(self.file, self.io) catch {};
+        }
     }
 };
 

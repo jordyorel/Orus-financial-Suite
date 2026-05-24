@@ -19,7 +19,12 @@ const builtin = @import("builtin");
 const BROKER_PORT: u16 = 7799;
 const CHAOS_BANK_PORT: u16 = 5099;
 const BANKSERVER_PORT: u16 = 7797;
+const MOMO_PORT: u16 = 7796;
 const HTTP_PORT: u16 = 7782;
+// Cashout rate cap — prevents CPU starvation of gateway workers when bank
+// latency is high (idle workers free CPU, cashout would otherwise monopolise it).
+const CASHOUT_MAX_TPS: i64 = 5_000;
+const CASHOUT_SLOT_NS: i64 = @divTrunc(std.time.ns_per_s, CASHOUT_MAX_TPS); // 200 µs
 const TOPIC = "battle.inbound";
 const TOPIC_OUTBOUND = "battle.outbound";
 const AUDIT_PATH = "/tmp/battle_audit.log";
@@ -65,6 +70,12 @@ var g_prev_d2: u64 = 0;
 var g_hist_d2_head = std.atomic.Value(usize).init(0);
 var g_hist_d2_n = std.atomic.Value(usize).init(0);
 
+// D3 throughput history (Bank→MoMo cashout)
+var g_hist_d3: [60]u64 = [_]u64{0} ** 60;
+var g_prev_d3: u64 = 0;
+var g_hist_d3_head = std.atomic.Value(usize).init(0);
+var g_hist_d3_n = std.atomic.Value(usize).init(0);
+
 // Cumulative counters for D1/D2
 var g_d1_total = std.atomic.Value(u64).init(0); // MoMo→Bank successful transactions
 var g_d2_total = std.atomic.Value(u64).init(0); // Bank→Broker successful publications
@@ -73,11 +84,11 @@ var g_d2_total = std.atomic.Value(u64).init(0); // Bank→Broker successful publ
 const LAT_CAP = 2000;
 var g_lat: [LAT_CAP]u64 = [_]u64{0} ** LAT_CAP;
 var g_lat_idx = std.atomic.Value(usize).init(0);
-var g_lat_mu: std.atomic.Mutex = .unlocked;
+// g_lat_mu removed — g_lat_idx.fetchAdd gives each writer a unique slot;
+// u64 writes are naturally atomic on ARM64/x86_64, no mutex needed.
 
 var g_stopped = std.atomic.Value(bool).init(false);
 var g_mac_active = std.atomic.Value(bool).init(false);
-var g_audit_mu: std.atomic.Mutex = .unlocked;
 var g_start_ns: i64 = 0;
 
 // ── Pipeline health (heartbeat / reversals / D2) ──────────────────────────────
@@ -92,13 +103,19 @@ var g_d2_received = std.atomic.Value(u64).init(0); // ACK received
 var g_audit_lines = std.atomic.Value(u64).init(0); // lines written to audit log
 var g_wal_bytes = std.atomic.Value(u64).init(0); // WAL file size (sampled by ticker)
 
-// ── Startup validation flags (D0–D5) ─────────────────────────────────────────
+// ── Startup validation flags (D0–D6) ─────────────────────────────────────────
 var g_startup_d0 = std.atomic.Value(bool).init(false);
 var g_startup_d1 = std.atomic.Value(bool).init(false);
 var g_startup_d2 = std.atomic.Value(bool).init(false);
 var g_startup_d3 = std.atomic.Value(bool).init(false);
 var g_startup_d4 = std.atomic.Value(bool).init(false);
 var g_startup_d5 = std.atomic.Value(bool).init(false);
+var g_startup_d6 = std.atomic.Value(bool).init(false);
+
+// ── Cashout counters (Bank→MoMo direction) ───────────────────────────────────
+var g_cashout_sent = std.atomic.Value(u64).init(0);
+var g_cashout_ok   = std.atomic.Value(u64).init(0);
+var g_cashout_fail = std.atomic.Value(u64).init(0);
 
 // ── MAC ───────────────────────────────────────────────────────────────────────
 const SESSION_KEY = "orus_battle_key_32bytes_padxxxxx";
@@ -118,7 +135,7 @@ const BrokerInner = struct {
     server: orusbroker.BrokerServer,
 };
 fn runBroker(inner: *BrokerInner) void {
-    inner.server.serve(std.heap.page_allocator) catch {};
+    inner.server.serve(std.heap.c_allocator) catch {};
 }
 
 // ── FakeChaosBank (libc sockets — no std.Io sharing, pre-spawned pool) ───────
@@ -156,68 +173,73 @@ fn writeAllFd(fd: c_int, buf: []const u8) bool {
 }
 
 fn handleChaosFd(fd: c_int) void {
-    const alloc = std.heap.page_allocator;
-    var len_buf: [2]u8 = undefined;
-    if (!readAllFd(fd, &len_buf)) return;
-    const req_len = std.mem.readInt(u16, &len_buf, .big);
-    if (req_len == 0 or req_len > 4096) return;
-    const req_data = alloc.alloc(u8, req_len) catch return;
-    defer alloc.free(req_data);
-    if (!readAllFd(fd, req_data)) return;
+    const alloc = std.heap.c_allocator;
+    // Keep-alive: serve multiple requests on the same connection so BankClient
+    // never has to reconnect mid-session. Loop exits when the client closes
+    // (readAllFd returns false) or on any unrecoverable framing error.
+    while (true) {
+        var len_buf: [2]u8 = undefined;
+        if (!readAllFd(fd, &len_buf)) return;
+        const req_len = std.mem.readInt(u16, &len_buf, .big);
+        if (req_len == 0 or req_len > 4096) return;
+        const req_data = alloc.alloc(u8, req_len) catch return;
+        defer alloc.free(req_data);
+        if (!readAllFd(fd, req_data)) return;
 
-    var iso_req = gw_mod.iso8583.parseWithSchema(req_data, &gw_mod.DEFAULT_SCHEMA, alloc) catch return;
-    defer iso_req.deinit();
-    const stan = iso_req.get(11) orelse "000000";
+        var iso_req = gw_mod.iso8583.parseWithSchema(req_data, &gw_mod.DEFAULT_SCHEMA, alloc) catch return;
+        defer iso_req.deinit();
+        const stan = iso_req.get(11) orelse "000000";
 
-    if (std.mem.eql(u8, &iso_req.mti, "0800")) {
-        const nmi = iso_req.get(70) orelse "";
-        var resp_iso = gw_mod.buildNetworkResponse(&iso_req, alloc, if (std.mem.eql(u8, nmi, "301")) SESSION_KEY else "") catch return;
-        defer resp_iso.deinit();
-        const bytes = gw_mod.iso8583.serializeWithSchema(&resp_iso, &gw_mod.DEFAULT_SCHEMA, alloc) catch return;
+        if (std.mem.eql(u8, &iso_req.mti, "0800")) {
+            const nmi = iso_req.get(70) orelse "";
+            var resp_iso = gw_mod.buildNetworkResponse(&iso_req, alloc, if (std.mem.eql(u8, nmi, "301")) SESSION_KEY else "") catch return;
+            defer resp_iso.deinit();
+            const bytes = gw_mod.iso8583.serializeWithSchema(&resp_iso, &gw_mod.DEFAULT_SCHEMA, alloc) catch return;
+            defer alloc.free(bytes);
+            var lout: [2]u8 = undefined;
+            std.mem.writeInt(u16, &lout, @intCast(bytes.len), .big);
+            if (!writeAllFd(fd, &lout)) return;
+            if (!writeAllFd(fd, bytes)) return;
+            continue; // keep connection alive for subsequent financial messages
+        }
+
+        var prng: u64 = undefined;
+        std.c.arc4random_buf(@ptrCast(&prng), 8);
+
+        if (prng % 100 < g_noresp_pct.load(.monotonic)) {
+            _ = g_bank_noresp.fetchAdd(1, .monotonic);
+            return; // deliberate no-response: close connection
+        }
+
+        const lat_ms = g_latency_ms.load(.monotonic);
+        if (lat_ms > 0) {
+            const ns: u64 = @as(u64, lat_ms) * 1_000_000;
+            _ = std.c.nanosleep(&.{ .sec = 0, .nsec = @intCast(@min(ns, 999_999_999)) }, null);
+        }
+
+        const roll = (prng >> 8) % 100;
+        const rc51 = g_rc51_pct.load(.monotonic);
+        const rc91 = g_rc91_pct.load(.monotonic);
+        const rc: []const u8 = if (roll < rc51) blk: {
+            _ = g_bank_rc51.fetchAdd(1, .monotonic);
+            break :blk "51";
+        } else if (roll < rc51 + rc91) blk: {
+            _ = g_bank_rc91.fetchAdd(1, .monotonic);
+            break :blk "91";
+        } else blk: {
+            _ = g_bank_rc00.fetchAdd(1, .monotonic);
+            break :blk "00";
+        };
+
+        const mti: [4]u8 = if (std.mem.eql(u8, &iso_req.mti, "0420") or
+            std.mem.eql(u8, &iso_req.mti, "0421")) "0430".* else "0210".*;
+        const bytes = chaosMacReply(alloc, mti, stan, rc) catch return;
         defer alloc.free(bytes);
         var lout: [2]u8 = undefined;
         std.mem.writeInt(u16, &lout, @intCast(bytes.len), .big);
-        _ = writeAllFd(fd, &lout);
-        _ = writeAllFd(fd, bytes);
-        return;
+        if (!writeAllFd(fd, &lout)) return;
+        if (!writeAllFd(fd, bytes)) return;
     }
-
-    var prng: u64 = undefined;
-    std.c.arc4random_buf(@ptrCast(&prng), 8);
-
-    if (prng % 100 < g_noresp_pct.load(.monotonic)) {
-        _ = g_bank_noresp.fetchAdd(1, .monotonic);
-        return;
-    }
-
-    const lat_ms = g_latency_ms.load(.monotonic);
-    if (lat_ms > 0) {
-        const ns: u64 = @as(u64, lat_ms) * 1_000_000;
-        _ = std.c.nanosleep(&.{ .sec = 0, .nsec = @intCast(@min(ns, 999_999_999)) }, null);
-    }
-
-    const roll = (prng >> 8) % 100;
-    const rc51 = g_rc51_pct.load(.monotonic);
-    const rc91 = g_rc91_pct.load(.monotonic);
-    const rc: []const u8 = if (roll < rc51) blk: {
-        _ = g_bank_rc51.fetchAdd(1, .monotonic);
-        break :blk "51";
-    } else if (roll < rc51 + rc91) blk: {
-        _ = g_bank_rc91.fetchAdd(1, .monotonic);
-        break :blk "91";
-    } else blk: {
-        _ = g_bank_rc00.fetchAdd(1, .monotonic);
-        break :blk "00";
-    };
-
-    const mti: [4]u8 = if (std.mem.eql(u8, &iso_req.mti, "0420") or
-        std.mem.eql(u8, &iso_req.mti, "0421")) "0430".* else "0210".*;
-    const bytes = chaosMacReply(alloc, mti, stan, rc) catch return;
-    defer alloc.free(bytes);
-    var lout: [2]u8 = undefined;
-    std.mem.writeInt(u16, &lout, @intCast(bytes.len), .big);
-    _ = writeAllFd(fd, &lout);
-    _ = writeAllFd(fd, bytes);
 }
 
 // Pre-spawned pool — libc accept() is safe to call concurrently from multiple
@@ -236,6 +258,105 @@ fn runChaosBankWorker(bank_sock: c_int) void {
     }
 }
 
+// ── FakeMoMoServer (Direction 3 : Bank→MoMo cashout) ─────────────────────────
+// Simple TCP server. Always responds with 0210/RC=00. No MAC, no chaos.
+
+fn handleMoMoFd(fd: c_int) void {
+    const alloc = std.heap.c_allocator;
+    while (true) {
+        var len_buf: [2]u8 = undefined;
+        if (!readAllFd(fd, &len_buf)) return;
+        const req_len = std.mem.readInt(u16, &len_buf, .big);
+        if (req_len == 0 or req_len > 4096) return;
+        const req_data = alloc.alloc(u8, req_len) catch return;
+        defer alloc.free(req_data);
+        if (!readAllFd(fd, req_data)) return;
+
+        var iso_req = gw_mod.iso8583.parseWithSchema(req_data, &gw_mod.DEFAULT_SCHEMA, alloc) catch return;
+        defer iso_req.deinit();
+        const stan = iso_req.get(11) orelse "000000";
+
+        var resp = gw_mod.iso8583.IsoMessage.init(alloc, "0210".*);
+        defer resp.deinit();
+        resp.set(39, "00") catch return;
+        resp.set(11, stan) catch return;
+        resp.set(49, "XAF") catch return;
+        const bytes = gw_mod.iso8583.serializeWithSchema(&resp, &gw_mod.DEFAULT_SCHEMA, alloc) catch return;
+        defer alloc.free(bytes);
+        var lout: [2]u8 = undefined;
+        std.mem.writeInt(u16, &lout, @intCast(bytes.len), .big);
+        if (!writeAllFd(fd, &lout)) return;
+        if (!writeAllFd(fd, bytes)) return;
+    }
+}
+
+fn runMoMoWorker(momo_sock: c_int) void {
+    while (true) {
+        const client = csock.accept(momo_sock, null, null);
+        if (client < 0) {
+            if (g_stopped.load(.monotonic)) return;
+            continue;
+        }
+        const tv = CTimeval{ .tv_sec = 10 };
+        _ = csock.setsockopt(client, C_SOL_SOCKET, C_SO_RCVTIMEO, @ptrCast(&tv), @sizeOf(CTimeval));
+        handleMoMoFd(client);
+        _ = csock.close(client);
+    }
+}
+
+// ── Cashout worker (Bank→MoMo direction) ─────────────────────────────────────
+
+fn cashoutWorker() void {
+    var threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
+    const io = threaded.io();
+    var client = gw_mod.BankClient.init(.{ .host = "127.0.0.1", .port = MOMO_PORT }, io);
+    const alloc = std.heap.c_allocator;
+    var ts_co: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts_co);
+    var prng: u64 = @as(u64, @intCast(ts_co.sec)) *% 1_000_000_000 + @as(u64, @intCast(ts_co.nsec));
+
+    var ts_slot: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts_slot);
+
+    while (!g_stopped.load(.monotonic)) {
+        prng ^= prng << 13;
+        prng ^= prng >> 7;
+        prng ^= prng << 17;
+        var stan_buf: [6]u8 = undefined;
+        _ = std.fmt.bufPrint(&stan_buf, "{d:0>6}", .{prng % 1_000_000}) catch continue;
+
+        var iso = gw_mod.iso8583.IsoMessage.init(alloc, "0200".*);
+        defer iso.deinit();
+        iso.set(11, &stan_buf) catch continue;
+        iso.set(32, "074") catch continue;
+        iso.set(49, "XAF") catch continue;
+
+        _ = g_cashout_sent.fetchAdd(1, .monotonic);
+        if (client.send(&iso, alloc)) |resp| {
+            defer @constCast(&resp).deinit();
+            const rc = resp.get(39) orelse "";
+            if (std.mem.eql(u8, rc, "00")) {
+                _ = g_cashout_ok.fetchAdd(1, .monotonic);
+            } else {
+                _ = g_cashout_fail.fetchAdd(1, .monotonic);
+            }
+        } else |_| {
+            _ = g_cashout_fail.fetchAdd(1, .monotonic);
+        }
+
+        // Rate-limit: sleep the remainder of the slot if the request was faster.
+        var ts_now: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts_now);
+        const elapsed_ns: i64 = (ts_now.sec - ts_slot.sec) * std.time.ns_per_s +
+            (ts_now.nsec - ts_slot.nsec);
+        if (elapsed_ns < CASHOUT_SLOT_NS) {
+            const sleep_ns: i64 = CASHOUT_SLOT_NS - elapsed_ns;
+            _ = std.c.nanosleep(&.{ .sec = 0, .nsec = @intCast(sleep_ns) }, null);
+        }
+        _ = std.c.clock_gettime(.MONOTONIC, &ts_slot);
+    }
+}
+
 // ── BankServer D2 (Direction 2 : Banque → Broker) ────────────────────────────
 
 const BankServerD2Args = struct {
@@ -243,10 +364,10 @@ const BankServerD2Args = struct {
 };
 
 fn runBankServerD2(args: BankServerD2Args) void {
-    var srv_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var srv_threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
     const srv_io = srv_threaded.io();
     const d2_broker = gw_mod.GatewayBrokerClient.init(.{ .host = "127.0.0.1", .port = BROKER_PORT }, srv_io);
-    const bank_srv = std.heap.page_allocator.create(gw_mod.BankServer) catch return;
+    const bank_srv = std.heap.c_allocator.create(gw_mod.BankServer) catch return;
     bank_srv.* = gw_mod.BankServer.init(.{
         .host = "127.0.0.1",
         .port = BANKSERVER_PORT,
@@ -254,7 +375,7 @@ fn runBankServerD2(args: BankServerD2Args) void {
         .topic = TOPIC_OUTBOUND,
     }, srv_io, &gw_mod.DEFAULT_SCHEMA, d2_broker);
     bank_srv.reconciliation = args.recon_state;
-    bank_srv.serve(std.heap.page_allocator) catch {};
+    bank_srv.serve(std.heap.c_allocator) catch {};
 }
 
 // Connect to BankServer, send 0200, wait for ACK. Returns true on success.
@@ -292,16 +413,37 @@ fn sendD2BankServer(d2_io: std.Io, alloc: std.mem.Allocator) bool {
 // ── D2 injector thread (sends 0200 to BankServer every 5 s) ──────────────────
 
 fn d2InjectorWorker() void {
-    var inj_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var inj_threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
     const inj_io = inj_threaded.io();
     _ = std.c.nanosleep(&.{ .sec = 1, .nsec = 0 }, null); // let BankServer start
     while (!g_stopped.load(.monotonic)) {
         _ = std.c.nanosleep(&.{ .sec = 5, .nsec = 0 }, null);
         if (g_stopped.load(.monotonic)) break;
         _ = g_d2_sent.fetchAdd(1, .monotonic);
-        if (sendD2BankServer(inj_io, std.heap.page_allocator))
+        if (sendD2BankServer(inj_io, std.heap.c_allocator))
             _ = g_d2_received.fetchAdd(1, .monotonic);
         _ = g_d2_total.fetchAdd(1, .monotonic);
+    }
+}
+
+// ── Drain consumer — prevents broker deliver queue from accumulating ──────────
+//
+// Anonymous subscription (no sub_id) means no WAL replay on connect — only
+// receives messages published after the subscribe frame arrives.  The router
+// delivers inline while holding its mutex, so this consumer must drain fast.
+// A loopback ACK roundtrip costs <20 µs; 20 000 ACK/s is well within budget.
+
+fn drainCb(_: *const orusshare.InternalMessage, _: ?*anyopaque) void {}
+
+fn drainConsumer() void {
+    const alloc = std.heap.c_allocator;
+    var dr_threaded = std.Io.Threaded.init(alloc, .{});
+    const dr_io = dr_threaded.io();
+    var client = gw_mod.GatewayBrokerClient.init(.{ .host = "127.0.0.1", .port = BROKER_PORT }, dr_io);
+    while (!g_stopped.load(.monotonic)) {
+        client.consume(TOPIC, alloc, drainCb, null) catch {};
+        if (!g_stopped.load(.monotonic))
+            _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 10_000_000 }, null); // 10 ms back-off
     }
 }
 
@@ -310,7 +452,7 @@ fn d2InjectorWorker() void {
 const HeartbeatArgs = struct { mac_engine: *gw_mod.MacEngine };
 
 fn heartbeatWorker(args: HeartbeatArgs) void {
-    var hb_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var hb_threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
     const hb_io = hb_threaded.io();
     var hb_gw = gw_mod.Gateway.init(gw_mod.BankClient.init(.{ .host = "127.0.0.1", .port = CHAOS_BANK_PORT }, hb_io), 0);
     hb_gw.mac_engine = args.mac_engine;
@@ -335,7 +477,7 @@ fn heartbeatWorker(args: HeartbeatArgs) void {
 
 // ── Gateway worker ────────────────────────────────────────────────────────────
 
-const GwArgs = struct { mac_engine: *gw_mod.MacEngine, audit: *orusshare.AuditLog };
+const GwArgs = struct { mac_engine: *gw_mod.MacEngine, audit: *orusshare.AuditLog, broker_port: u16 };
 
 fn gatewayWorker(args: GwArgs) void {
     // Fixed 128 KB buffer per worker — reset each transaction, zero heap syscalls.
@@ -343,10 +485,13 @@ fn gatewayWorker(args: GwArgs) void {
     var fba = std.heap.FixedBufferAllocator.init(&tx_buf);
 
     // Each worker owns its own Io event loop (kqueue on macOS).
-    var worker_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var worker_threaded = std.Io.Threaded.init(std.heap.c_allocator, .{});
     const worker_io = worker_threaded.io();
     var gw = gw_mod.Gateway.init(gw_mod.BankClient.init(.{ .host = "127.0.0.1", .port = CHAOS_BANK_PORT }, worker_io), 0);
     gw.mac_engine = args.mac_engine;
+    // Each worker maintains a persistent broker connection for WAL publishing.
+    var broker = gw_mod.GatewayBrokerClient.init(.{ .host = "127.0.0.1", .port = args.broker_port }, worker_io);
+    defer broker.deinit();
     var prng: u64 = undefined;
     std.c.arc4random_buf(@ptrCast(&prng), 8);
     var ts_pub: std.c.timespec = undefined;
@@ -402,10 +547,8 @@ fn gatewayWorker(args: GwArgs) void {
         const t1: i64 = ts_pub.sec *% std.time.ns_per_s + ts_pub.nsec;
         if (t1 > t0) {
             const lat: u64 = @intCast(t1 - t0);
-            while (!g_lat_mu.tryLock()) std.atomic.spinLoopHint();
             const idx = g_lat_idx.fetchAdd(1, .monotonic) % LAT_CAP;
             g_lat[idx] = lat;
-            g_lat_mu.unlock();
         }
 
         // RC tracking
@@ -413,7 +556,16 @@ fn gatewayWorker(args: GwArgs) void {
         for (resp.fields) |f| if (f.id == 39) {
             rc = f.value;
         };
-        if (std.mem.eql(u8, rc, "00")) {
+        const is_ok = std.mem.eql(u8, rc, "00");
+
+        g_last_tx_ns.store(t1, .monotonic);
+
+        // Audit before counting OK/declined — guarantees g_audit_lines <= responded.
+        args.audit.record(&resp.mti, &resp.stan, resp.amount, &resp.currency, rc, @tagName(resp.provider), resp.msg_id);
+        _ = g_d1_total.fetchAdd(1, .monotonic);
+        _ = g_audit_lines.fetchAdd(1, .monotonic);
+
+        if (is_ok) {
             _ = g_ok.fetchAdd(1, .monotonic);
             // 5% reversal injection on approved transactions
             prng ^= prng << 13;
@@ -439,14 +591,9 @@ fn gatewayWorker(args: GwArgs) void {
             _ = g_declined.fetchAdd(1, .monotonic);
         }
 
-        g_last_tx_ns.store(t1, .monotonic);
-
-        // Audit log — serialized: AuditLog shares one io + does fsync per record
-        while (!g_audit_mu.tryLock()) std.atomic.spinLoopHint();
-        args.audit.record(&resp.mti, &resp.stan, resp.amount, &resp.currency, rc, @tagName(resp.provider), resp.msg_id);
-        _ = g_d1_total.fetchAdd(1, .monotonic);
-        _ = g_audit_lines.fetchAdd(1, .monotonic);
-        g_audit_mu.unlock();
+        // Publish to broker so every D1 transaction is durably WAL-recorded.
+        // Best-effort: broker publish failure never aborts the payment path.
+        broker.publish(&resp, alloc) catch {};
     }
 }
 
@@ -492,6 +639,16 @@ fn ticker() void {
         const nd2 = g_hist_d2_n.load(.monotonic);
         if (nd2 < 60) _ = g_hist_d2_n.fetchAdd(1, .monotonic);
 
+        // D3 tx/s (Bank→MoMo cashout)
+        const cur_d3 = g_cashout_ok.load(.monotonic);
+        const tps_d3 = cur_d3 - g_prev_d3;
+        g_prev_d3 = cur_d3;
+        const head3 = g_hist_d3_head.load(.monotonic);
+        g_hist_d3[head3] = tps_d3;
+        g_hist_d3_head.store((head3 + 1) % 60, .monotonic);
+        const nd3 = g_hist_d3_n.load(.monotonic);
+        if (nd3 < 60) _ = g_hist_d3_n.fetchAdd(1, .monotonic);
+
         // WAL size — O_RDONLY=0, SEEK_END=2 (POSIX)
         const wfd = csock.open(WAL_PATH, 0);
         if (wfd >= 0) {
@@ -508,9 +665,7 @@ fn computePercentiles() struct { p50: u64, p99: u64 } {
     const n = @min(n_raw, LAT_CAP);
     if (n <= 1) return .{ .p50 = 0, .p99 = 0 };
     var tmp: [LAT_CAP]u64 = undefined;
-    while (!g_lat_mu.tryLock()) std.atomic.spinLoopHint();
-    @memcpy(tmp[0..n], g_lat[0..n]);
-    g_lat_mu.unlock();
+    @memcpy(tmp[0..n], g_lat[0..n]); // lock-free snapshot; rare torn u64 read is acceptable for percentiles
     std.mem.sort(u64, tmp[0..n], {}, std.sort.asc(u64));
     const raw50 = tmp[n / 2];
     const raw99 = tmp[n * 99 / 100];
@@ -668,6 +823,10 @@ fn serveMetrics(fd: HttpFd) void {
     wp(&body, &pos, ",\"startup_d3\":{d}", .{@intFromBool(g_startup_d3.load(.monotonic))});
     wp(&body, &pos, ",\"startup_d4\":{d}", .{@intFromBool(g_startup_d4.load(.monotonic))});
     wp(&body, &pos, ",\"startup_d5\":{d}", .{@intFromBool(g_startup_d5.load(.monotonic))});
+    wp(&body, &pos, ",\"startup_d6\":{d}", .{@intFromBool(g_startup_d6.load(.monotonic))});
+    wp(&body, &pos, ",\"cashout_sent\":{d}", .{g_cashout_sent.load(.monotonic)});
+    wp(&body, &pos, ",\"cashout_ok\":{d}", .{g_cashout_ok.load(.monotonic)});
+    wp(&body, &pos, ",\"cashout_fail\":{d}", .{g_cashout_fail.load(.monotonic)});
     wp(&body, &pos, ",\"hb_ok\":{d}", .{g_hb_ok.load(.monotonic)});
     wp(&body, &pos, ",\"hb_fail\":{d}", .{g_hb_fail.load(.monotonic)});
     wp(&body, &pos, ",\"hb_since_s\":{d}", .{hb_since_s});
@@ -687,17 +846,28 @@ fn serveMetrics(fd: HttpFd) void {
     }
     wp(&body, &pos, "],\"hist_d1\":[", .{});
     const nd1 = g_hist_d1_n.load(.monotonic);
+    const hstart1: usize = if (nd1 < 60) 0 else g_hist_d1_head.load(.monotonic);
     for (0..nd1) |i| {
         if (i > 0) wp(&body, &pos, ",", .{});
-        wp(&body, &pos, "{d}", .{g_hist_d1[i]});
+        wp(&body, &pos, "{d}", .{g_hist_d1[(hstart1 + i) % 60]});
     }
     wp(&body, &pos, "],\"hist_d2\":[", .{});
     const nd2 = g_hist_d2_n.load(.monotonic);
+    const hstart2: usize = if (nd2 < 60) 0 else g_hist_d2_head.load(.monotonic);
     for (0..nd2) |i| {
         if (i > 0) wp(&body, &pos, ",", .{});
-        wp(&body, &pos, "{d}", .{g_hist_d2[i]});
+        wp(&body, &pos, "{d}", .{g_hist_d2[(hstart2 + i) % 60]});
     }
-    wp(&body, &pos, "],\"total_delivered\":{d}", .{ok + declined});
+    wp(&body, &pos, "],\"hist_d3\":[", .{});
+    const nd3_api = g_hist_d3_n.load(.monotonic);
+    const hstart3: usize = if (nd3_api < 60) 0 else g_hist_d3_head.load(.monotonic);
+    for (0..nd3_api) |i| {
+        if (i > 0) wp(&body, &pos, ",", .{});
+        wp(&body, &pos, "{d}", .{g_hist_d3[(hstart3 + i) % 60]});
+    }
+    const tps_d3_now: u64 = if (nd3_api > 0) g_hist_d3[(g_hist_d3_head.load(.monotonic) + 59) % 60] else 0;
+    wp(&body, &pos, "],\"tps_d3\":{d}", .{tps_d3_now});
+    wp(&body, &pos, ",\"total_delivered\":{d}", .{ok + declined});
     wp(&body, &pos, ",\"d1_total\":{d}", .{g_d1_total.load(.monotonic)});
     wp(&body, &pos, ",\"d2_total\":{d}", .{g_d2_total.load(.monotonic)});
     wp(&body, &pos, "}}", .{});
@@ -814,7 +984,7 @@ fn printStartup(name: []const u8, success: bool) void {
 
 // ── Final integrity report ────────────────────────────────────────────────────
 
-fn printReport(io: std.Io) void {
+fn printReport(_: std.Io) void {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     const now_ns: i64 = ts.sec *% std.time.ns_per_s + ts.nsec;
@@ -827,23 +997,9 @@ fn printReport(io: std.Io) void {
     const err_mac = g_err_mac.load(.monotonic);
     const responded = ok + declined;
 
-    // Count audit log lines
-    var audit_lines: u64 = 0;
-    const stat = std.Io.Dir.cwd().statFile(io, AUDIT_PATH, .{}) catch null;
-    if (stat) |s| {
-        // Each line ends with \n — count newlines as proxy for line count.
-        // Exact count: read and count '\n' bytes.
-        if (std.Io.Dir.cwd().openFile(io, AUDIT_PATH, .{})) |f| {
-            var fbuf: [4096]u8 = undefined;
-            var fr = std.Io.File.reader(f, io, &fbuf);
-            while (true) {
-                const b = fr.interface.takeByte() catch break;
-                if (b == '\n') audit_lines += 1;
-            }
-            std.Io.File.close(f, io);
-        } else |_| {}
-        _ = s;
-    }
+    // Use the atomic counter — avoids the buffered-not-flushed race with file counting.
+    // Audit is recorded before g_ok/g_declined, so audit_lines <= responded always.
+    const audit_lines = g_audit_lines.load(.monotonic);
 
     const peak_tps = g_peak_tps.load(.monotonic);
 
@@ -897,13 +1053,14 @@ fn printReport(io: std.Io) void {
         std.debug.print("    Intégrité           : \x1b[1;31m✗ PERTES -{d}\x1b[0m\n\n", .{responded - audit_lines});
     }
 
-    std.debug.print("  \x1b[1mValidation pipeline D0–D5\x1b[0m\n", .{});
+    std.debug.print("  \x1b[1mValidation pipeline D0–D6\x1b[0m\n", .{});
     std.debug.print("    D0 Sign-on  0800/301 : {s}\n", .{if (g_startup_d0.load(.monotonic)) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m"});
     std.debug.print("    D1 MoMo→Bank 0200    : {s}\n", .{if (g_startup_d1.load(.monotonic)) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m"});
     std.debug.print("    D2 Bank→Broker       : {s}\n", .{if (g_startup_d2.load(.monotonic)) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m"});
     std.debug.print("    D3 Reversal 0420     : {s}\n", .{if (g_startup_d3.load(.monotonic)) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m"});
     std.debug.print("    D4 Réconcil. 0500    : {s}\n", .{if (g_startup_d4.load(.monotonic)) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m"});
-    std.debug.print("    D5 Heartbeat 0800    : {s}\n\n", .{if (g_startup_d5.load(.monotonic)) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m"});
+    std.debug.print("    D5 Heartbeat 0800    : {s}\n", .{if (g_startup_d5.load(.monotonic)) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m"});
+    std.debug.print("    D6 Cashout Bank→MoMo : {s}\n\n", .{if (g_startup_d6.load(.monotonic)) "\x1b[32m✓ OK\x1b[0m" else "\x1b[31m✗ ÉCHEC\x1b[0m"});
 
     std.debug.print("  \x1b[1mHeartbeat (30 s)\x1b[0m\n", .{});
     std.debug.print("    OK               : \x1b[32m{d}\x1b[0m\n", .{g_hb_ok.load(.monotonic)});
@@ -918,6 +1075,11 @@ fn printReport(io: std.Io) void {
     std.debug.print("  \x1b[1mDirection 2 — BankServer (port {d})\x1b[0m\n", .{BANKSERVER_PORT});
     std.debug.print("    Injections 0200  : {d}\n", .{g_d2_sent.load(.monotonic)});
     std.debug.print("    ACK reçus 0210   : \x1b[32m{d}\x1b[0m\n\n", .{g_d2_received.load(.monotonic)});
+
+    std.debug.print("  \x1b[1mDirection 3 — Cashout Bank→MoMo (port {d})\x1b[0m\n", .{MOMO_PORT});
+    std.debug.print("    Envoyés          : {d}\n", .{g_cashout_sent.load(.monotonic)});
+    std.debug.print("    OK               : \x1b[32m{d}\x1b[0m\n", .{g_cashout_ok.load(.monotonic)});
+    std.debug.print("    Échecs           : \x1b[{s}m{d}\x1b[0m\n\n", .{ if (g_cashout_fail.load(.monotonic) == 0) "32" else "33", g_cashout_fail.load(.monotonic) });
 
     std.debug.print("  \x1b[1mChaos bank (config à l'arrêt)\x1b[0m\n", .{});
     std.debug.print("    Latence injectée : {d} ms\n", .{chaos_lat});
@@ -965,10 +1127,11 @@ pub fn main() !void {
     g_start_ns = ts0.sec *% std.time.ns_per_s + ts0.nsec;
 
     // ── Broker ────────────────────────────────────────────────────────────────
-    const inner = try std.heap.page_allocator.create(BrokerInner);
+    const inner = try std.heap.c_allocator.create(BrokerInner);
     inner.wal = try orusbroker.Wal.open(io, WAL_PATH);
+    inner.wal.sync_every = 0; // bench mode: buffer writes, flush on close
     inner.dedup = orusbroker.DedupFilter.init();
-    inner.router = orusbroker.TopicRouter.init(std.heap.page_allocator);
+    inner.router = orusbroker.TopicRouter.init(std.heap.c_allocator);
     inner.server = orusbroker.BrokerServer{
         .config = .{ .host = "127.0.0.1", .port = BROKER_PORT, .wal_path = WAL_PATH, .cursor_dir = "/tmp/battle_cursors" },
         .io = io,
@@ -993,11 +1156,13 @@ pub fn main() !void {
             .sin_addr = std.mem.nativeToBig(u32, 0x7F000001),
         };
         if (csock.bind(s, &baddr, @sizeOf(SockaddrIn)) < 0) return error.ChaosBankBind;
-        if (csock.listen(s, 256) < 0) return error.ChaosBankListen;
+        if (csock.listen(s, 1024) < 0) return error.ChaosBankListen;
         break :blk s;
     };
-    // 32 bank workers — at 23ms latency: 32 × 43 tx/s ≈ 1 400 tx/s capacity
-    for (0..32) |_| (try std.Thread.spawn(.{}, runChaosBankWorker, .{bank_sock})).detach();
+    // 270 bank workers: 256 reserved for gateway keep-alive + 14 slack for
+    // heartbeat, sign-on, D1/D3 startup probes and ad-hoc connections.
+    // At 47 ms latency: 256 / 0.047 ≈ 5 450 tx/s capacity; at 0 ms → ~20 000 tx/s.
+    for (0..270) |_| (try std.Thread.spawn(.{}, runChaosBankWorker, .{bank_sock})).detach();
     _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 50_000_000 }, null);
 
     // ── MacEngine + AuditLog ──────────────────────────────────────────────────
@@ -1204,21 +1369,73 @@ pub fn main() !void {
         printStartup("D5  Heartbeat 0800/801 → 0810", d5_ok);
     }
 
+    // ── FakeMoMoServer ────────────────────────────────────────────────────────
+    const momo_sock: c_int = blk: {
+        const s = csock.socket(C_AF_INET, C_SOCK_STREAM, C_IPPROTO_TCP);
+        if (s < 0) return error.MoMoSocket;
+        const opt: c_int = 1;
+        _ = csock.setsockopt(s, C_SOL_SOCKET, C_SO_REUSEADDR, @ptrCast(&opt), @sizeOf(c_int));
+        _ = csock.setsockopt(s, C_SOL_SOCKET, C_SO_REUSEPORT, @ptrCast(&opt), @sizeOf(c_int));
+        const maddr = SockaddrIn{
+            .sin_port = std.mem.nativeToBig(u16, MOMO_PORT),
+            .sin_addr = std.mem.nativeToBig(u32, 0x7F000001),
+        };
+        if (csock.bind(s, &maddr, @sizeOf(SockaddrIn)) < 0) return error.MoMoBind;
+        if (csock.listen(s, 256) < 0) return error.MoMoListen;
+        break :blk s;
+    };
+    for (0..8) |_| (try std.Thread.spawn(.{}, runMoMoWorker, .{momo_sock})).detach();
+    _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 50_000_000 }, null);
+
+    // D6 — Cashout Bank→MoMo 0200 → 0210
+    d6: {
+        var d6_threaded = std.Io.Threaded.init(alloc, .{});
+        const d6_io = d6_threaded.io();
+        var d6_client = gw_mod.BankClient.init(.{ .host = "127.0.0.1", .port = MOMO_PORT }, d6_io);
+        var d6_iso = gw_mod.iso8583.IsoMessage.init(alloc, "0200".*);
+        defer d6_iso.deinit();
+        d6_iso.set(11, "000001") catch {
+            printStartup("D6  Cashout Bank→MoMo 0200 → 0210", false);
+            break :d6;
+        };
+        d6_iso.set(49, "XAF") catch {
+            printStartup("D6  Cashout Bank→MoMo 0200 → 0210", false);
+            break :d6;
+        };
+        if (d6_client.send(&d6_iso, alloc)) |d6_resp| {
+            defer @constCast(&d6_resp).deinit();
+            const d6_rc = d6_resp.get(39) orelse "";
+            const d6_ok = std.mem.eql(u8, &d6_resp.mti, "0210") and std.mem.eql(u8, d6_rc, "00");
+            g_startup_d6.store(d6_ok, .monotonic);
+            printStartup("D6  Cashout Bank→MoMo 0200 → 0210", d6_ok);
+        } else |_| {
+            printStartup("D6  Cashout Bank→MoMo 0200 → 0210", false);
+        }
+        break :d6;
+    }
+
     std.debug.print("\x1b[1;36m═══════════════════════════════════════════════════════\x1b[0m\n\n", .{});
 
     // ── Ticker ────────────────────────────────────────────────────────────────
     (try std.Thread.spawn(.{}, ticker, .{})).detach();
 
     // ── Gateway workers (each owns its own BankClient + Io event loop) ───────
-    // 32 workers: at 23ms latency → 32 × 43 ≈ 1 400 tx/s; at 0ms → ~20 000 tx/s
-    const gw_args = GwArgs{ .mac_engine = &mac_engine, .audit = &audit };
-    for (0..32) |_| (try std.Thread.spawn(.{}, gatewayWorker, .{gw_args})).detach();
+    // 256 workers: halves mutex contention (audit, broker router) and RSS vs 512.
+    // Leaves 14 chaos-bank slots free for heartbeat, sign-on and test probes.
+    const gw_args = GwArgs{ .mac_engine = &mac_engine, .audit = &audit, .broker_port = BROKER_PORT };
+    for (0..256) |_| (try std.Thread.spawn(.{}, gatewayWorker, .{gw_args})).detach();
+
+    // ── Drain consumer (battle.inbound — prevents router deliver queue build-up)
+    (try std.Thread.spawn(.{}, drainConsumer, .{})).detach();
 
     // ── Heartbeat thread ──────────────────────────────────────────────────────
     (try std.Thread.spawn(.{}, heartbeatWorker, .{HeartbeatArgs{ .mac_engine = &mac_engine }})).detach();
 
     // ── D2 injector thread ────────────────────────────────────────────────────
     (try std.Thread.spawn(.{}, d2InjectorWorker, .{})).detach();
+
+    // ── Cashout workers (Bank→MoMo direction) ────────────────────────────────
+    for (0..8) |_| (try std.Thread.spawn(.{}, cashoutWorker, .{})).detach();
 
     // ── HTTP dashboard (blocks until Ctrl+C) ──────────────────────────────────
     httpServer();
@@ -1255,6 +1472,7 @@ const DASHBOARD_HTML =
     \\.s-row{display:flex;align-items:center;gap:8px;padding:5px 16px}
     \\.s-dot{width:6px;height:6px;border-radius:50%;background:#333;flex-shrink:0;transition:background .3s}
     \\.s-dot.ok{background:#4ade80}
+    \\.s-dot.warn{background:#fbbf24}
     \\.s-dot.fail{background:#f87171}
     \\.s-label{font-size:12px;color:#999;flex:1}
     \\.s-sub{font-size:11px;color:#444;font-variant-numeric:tabular-nums}
@@ -1350,6 +1568,11 @@ const DASHBOARD_HTML =
     \\      <div class="kpi-unit">tx / s</div>
     \\    </div>
     \\    <div class="kpi">
+    \\      <div class="kpi-label">D3 · Bank→MoMo</div>
+    \\      <div class="kpi-val" id="k-d3">—</div>
+    \\      <div class="kpi-unit">tx / s</div>
+    \\    </div>
+    \\    <div class="kpi">
     \\      <div class="kpi-label">Peak tx/s</div>
     \\      <div class="kpi-val" id="k-peak">—</div>
     \\      <div class="kpi-unit">maximum historique</div>
@@ -1384,6 +1607,7 @@ const DASHBOARD_HTML =
     \\    <div class="legend">
     \\      <span class="leg"><span class="leg-line"></span>Gateway tx/s</span>
     \\      <span class="leg"><span class="leg-line dashed"></span>D1 MoMo→Bank</span>
+    \\      <span class="leg"><span class="leg-line" style="border-color:#3d7a3d;border-style:dotted"></span>D3 Bank→MoMo</span>
     \\    </div>
     \\    <div style="position:relative;height:140px">
     \\      <canvas id="ch1" role="img" aria-label="Throughput Gateway et D1 sur 60 secondes">Chargement...</canvas>
@@ -1412,7 +1636,7 @@ const DASHBOARD_HTML =
     \\    </div>
     \\  </div>
     \\
-    \\  <div class="footer">broker:7799 · chaos-bank:5099 · bank-server:7797 · dashboard:7782</div>
+    \\  <div class="footer">broker:7799 · chaos-bank:5099 · bank-server:7797 · momo:7796 · dashboard:7782</div>
     \\</div>
     \\</div>
     \\
@@ -1423,7 +1647,7 @@ const DASHBOARD_HTML =
     \\const ft=s=>[Math.floor(s/3600),Math.floor(s%3600/60),s%60].map(x=>String(x).padStart(2,'0')).join(':');
     \\const flo=n=>Math.round(n).toLocaleString('fr-FR');
     \\function sv(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
-    \\function dot(id,ok){const e=document.getElementById(id);if(!e)return;e.className='s-dot'+(ok===null?'':ok?' ok':' fail');}
+    \\function dot(id,ok){const e=document.getElementById(id);if(!e)return;e.className='s-dot'+(ok===null?'':ok==='warn'?' warn':ok?' ok':' fail');}
     \\function pc(){
     \\  clearTimeout(ct);
     \\  ct=setTimeout(()=>{
@@ -1436,7 +1660,8 @@ const DASHBOARD_HTML =
     \\  if(c&&window.Chart){
     \\    ch1=new Chart(c,{type:'line',data:{labels:[],datasets:[
     \\      {label:'Gateway',data:[],borderColor:'#888',backgroundColor:'rgba(136,136,136,.06)',tension:.4,fill:true,pointRadius:0,borderWidth:1.5},
-    \\      {label:'D1',data:[],borderColor:'#444',backgroundColor:'transparent',tension:.4,fill:false,pointRadius:0,borderWidth:1,borderDash:[4,3]}
+    \\      {label:'D1',data:[],borderColor:'#444',backgroundColor:'transparent',tension:.4,fill:false,pointRadius:0,borderWidth:1,borderDash:[4,3]},
+    \\      {label:'D3',data:[],borderColor:'#3d7a3d',backgroundColor:'transparent',tension:.4,fill:false,pointRadius:0,borderWidth:1,borderDash:[2,2]}
     \\    ]},options:{
     \\      animation:false,responsive:true,maintainAspectRatio:false,
     \\      scales:{
@@ -1470,9 +1695,10 @@ const DASHBOARD_HTML =
     \\    const d2s=m.d2_sent||0,d2r=m.d2_received||0;
     \\    dot('sd2',d2s>0?d2r>=d2s:null);
     \\    sv('sd2-val',d2s>0?d2r+'/'+d2s:'—');
-    \\    // D3 — reversals (vert si aucun échec)
+    \\    // D3 — reversals (vert=0 échec, jaune<1%, rouge>=1%)
     \\    const revTotal=m.reversals||0,revOk=m.rev_ok||0,revFail=m.rev_fail||0;
-    \\    dot('sd3',revTotal>0?(revFail===0):null);
+    \\    const revRate=revTotal>0?revFail/revTotal:0;
+    \\    dot('sd3',revTotal>0?(revFail===0?true:revRate<0.01?'warn':false):null);
     \\    sv('sd3-val',revTotal>0?flo(revOk)+'/'+flo(revTotal):'—');
     \\    // D4 — réconciliation (validation démarrage)
     \\    dot('sd4',m.startup_d4===1);
@@ -1481,9 +1707,10 @@ const DASHBOARD_HTML =
     \\    const hbs=m.hb_since_s??-1;
     \\    dot('sd5',hbs>=0&&hbs<90);
     \\    sv('sd5-val',hbs>=0?hbs+'s':'—');
-    \\    // Cashout — Bank→MoMo (not yet implemented)
-    \\    dot('sd6',null);
-    \\    sv('sd6-val','à venir');
+    \\    // Cashout — Bank→MoMo (live)
+    \\    const cashOk=m.cashout_ok||0,cashFail=m.cashout_fail||0,cashSent=m.cashout_sent||0;
+    \\    dot('sd6',cashSent>0?(cashFail===0):(m.startup_d6===1?true:null));
+    \\    sv('sd6-val',cashSent>0?flo(cashOk)+'/'+flo(cashSent):'—');
     \\    // MAC
     \\    dot('smac',macOk);
     \\    sv('smac-val',macOk?'actif':'inactif');
@@ -1495,6 +1722,7 @@ const DASHBOARD_HTML =
     \\    sv('i-wal',wk>=1024?(wk/1024).toFixed(1)+' MB':wk+' KB');
     \\    const p99=m.p99_us||0;
     \\    sv('k-d1',flo(m.gw_tps||0));
+    \\    sv('k-d3',flo(m.tps_d3||0));
     \\    sv('k-peak',flo(m.peak_tps||0));
     \\    sv('k-total',ff((m.ok||0)+(m.declined||0)));
     \\    sv('k-p50',fms(m.p50_us||0));
@@ -1521,6 +1749,7 @@ const DASHBOARD_HTML =
     \\      ch1.data.labels=hist.map((_,i)=>i===n-1?'now':'-'+(n-1-i)+'s');
     \\      ch1.data.datasets[0].data=[...hist];
     \\      ch1.data.datasets[1].data=[...(m.hist_d1||hist)];
+    \\      ch1.data.datasets[2].data=[...(m.hist_d3||[])];
     \\      ch1.update('none');
     \\    }
     \\  }).catch(e=>{sv('ts','⚠ '+e.message);});

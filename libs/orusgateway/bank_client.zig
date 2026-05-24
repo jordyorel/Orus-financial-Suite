@@ -29,20 +29,29 @@ pub const BankClientError = error{
     MalformedResponse,
 };
 
-// Stateless client — connects, exchanges one request/response, disconnects.
-// V1: connect-per-request; connection pooling deferred to a later milestone.
+// Persistent-connection client — reuses the TCP stream across requests and
+// reconnects automatically on failure (up to 2 attempts per call).
+// TLS mode keeps connect-per-request because a TLS session is connection-bound.
 pub const BankClient = struct {
     config: Config,
     io: std.Io,
+    stream: ?std.Io.net.Stream = null,
 
     pub fn init(config: Config, io: std.Io) BankClient {
         return .{ .config = config, .io = io };
     }
 
+    pub fn deinit(self: *BankClient) void {
+        if (self.stream) |s| {
+            s.close(self.io);
+            self.stream = null;
+        }
+    }
+
     // Send msg to the bank and return the response IsoMessage.
     // The returned IsoMessage owns its arena; caller must call .deinit().
     pub fn send(
-        self: *const BankClient,
+        self: *BankClient,
         msg: *const IsoMessage,
         alloc: std.mem.Allocator,
     ) BankClientError!IsoMessage {
@@ -54,23 +63,23 @@ pub const BankClient = struct {
     // Like send() but accepts pre-serialized wire bytes — avoids re-serialization
     // when the caller has already built the bytes (e.g. after MAC computation).
     pub fn sendBytes(
-        self:      *const BankClient,
+        self:      *BankClient,
         req_bytes: []const u8,
         alloc:     std.mem.Allocator,
     ) BankClientError!IsoMessage {
-        const addr = std.Io.net.IpAddress.parse(self.config.host, self.config.port) catch
-            return error.BankUnreachable;
-        var stream = addr.connect(self.io, .{ .mode = .stream }) catch return error.BankUnreachable;
-        defer stream.close(self.io);
-
-        var read_buf: [8192]u8 = undefined;
-        var write_buf: [8192]u8 = undefined;
-        var sr = stream.reader(self.io, &read_buf);
-        var sw = stream.writer(self.io, &write_buf);
-
         switch (self.config.tls) {
-            .none => return self.doExchangeRaw(&sr.interface, &sw.interface, req_bytes, alloc),
+            // TLS is connection-bound: keep connect-per-request.
             .self_signed => {
+                const addr = std.Io.net.IpAddress.parse(self.config.host, self.config.port) catch
+                    return error.BankUnreachable;
+                var stream = addr.connect(self.io, .{ .mode = .stream }) catch return error.BankUnreachable;
+                defer stream.close(self.io);
+
+                var read_buf: [8192]u8 = undefined;
+                var write_buf: [8192]u8 = undefined;
+                var sr = stream.reader(self.io, &read_buf);
+                var sw = stream.writer(self.io, &write_buf);
+
                 var tls_read: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
                 var tls_write: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
                 var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
@@ -85,6 +94,29 @@ pub const BankClient = struct {
                 }) catch return error.BankUnreachable;
                 defer tls.end() catch {};
                 return self.doExchangeRaw(&tls.reader, &tls.writer, req_bytes, alloc);
+            },
+            // Persistent TCP: reuse stream, reconnect once on error.
+            .none => {
+                var attempt: u2 = 0;
+                while (attempt < 2) : (attempt += 1) {
+                    if (self.stream == null) {
+                        const addr = std.Io.net.IpAddress.parse(self.config.host, self.config.port) catch
+                            return error.BankUnreachable;
+                        self.stream = addr.connect(self.io, .{ .mode = .stream }) catch
+                            return error.BankUnreachable;
+                    }
+                    var read_buf: [8192]u8 = undefined;
+                    var write_buf: [8192]u8 = undefined;
+                    var sr = self.stream.?.reader(self.io, &read_buf);
+                    var sw = self.stream.?.writer(self.io, &write_buf);
+                    if (self.doExchangeRaw(&sr.interface, &sw.interface, req_bytes, alloc)) |result| {
+                        return result;
+                    } else |_| {
+                        self.stream.?.close(self.io);
+                        self.stream = null;
+                    }
+                }
+                return error.BankUnreachable;
             },
         }
     }
@@ -217,7 +249,7 @@ test "BankClient: 2-byte prefix round-trip" {
     try req.set(4, "000000010000");
     try req.set(49, "XAF");
 
-    const client = BankClient.init(.{
+    var client = BankClient.init(.{
         .host = "127.0.0.1",
         .port = TEST_PORT_2BYTE,
         .length_prefix = .two_byte_be,
@@ -255,7 +287,7 @@ test "BankClient: 4-byte prefix round-trip" {
     try req.set(4, "000000005000");
     try req.set(49, "XOF");
 
-    const client = BankClient.init(.{
+    var client = BankClient.init(.{
         .host = "127.0.0.1",
         .port = TEST_PORT_4BYTE,
         .length_prefix = .four_byte_be,
@@ -288,7 +320,7 @@ test "BankClient: ResponseTooLarge" {
     var req = IsoMessage.init(alloc, "0200".*);
     defer req.deinit();
 
-    const client = BankClient.init(.{
+    var client = BankClient.init(.{
         .host = "127.0.0.1",
         .port = TEST_PORT_TOOLARGE,
         .max_response_bytes = 10, // smaller than any valid ISO 8583 message

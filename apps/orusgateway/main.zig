@@ -151,7 +151,7 @@ fn loadConfig(alloc: std.mem.Allocator) !Config {
 const ConnCtx = struct {
     stream: std.Io.net.Stream,
     io: std.Io,
-    gateway: *const Gateway,
+    gateway: *Gateway,
     alloc: std.mem.Allocator,
 };
 
@@ -257,13 +257,13 @@ fn resolveIsoSchema(config: Config, io: std.Io, alloc: std.mem.Allocator) !schem
 // ── Direction 1: OrusBroker → Gateway → Bank ─────────────────────────────────
 
 const D1Args = struct {
-    gateway: *const Gateway,
+    gateway: *Gateway,
     broker:  GatewayBrokerClient,
     alloc:   std.mem.Allocator,
 };
 
 fn onD1Message(raw_msg: *const orusshare.InternalMessage, raw_ctx: ?*anyopaque) void {
-    const args: *const D1Args = @ptrCast(@alignCast(raw_ctx.?));
+    const args: *D1Args = @ptrCast(@alignCast(raw_ctx.?));
 
     // Avoid infinite loop: skip messages that already came from the bank leg.
     if (raw_msg.origin == .iso8583) return;
@@ -289,7 +289,7 @@ fn d1ConsumeLoop(args: *D1Args) void {
             "transactions.inbound",
             args.alloc,
             onD1Message,
-            @ptrCast(@constCast(args)),
+            @ptrCast(args),
         ) catch {};
         // Brief pause before reconnect so we don't spin on a dead broker.
         const ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
@@ -298,7 +298,7 @@ fn d1ConsumeLoop(args: *D1Args) void {
 }
 
 const BankServerArgs = struct {
-    server: *const BankServer,
+    server: *BankServer,
     alloc: std.mem.Allocator,
 };
 

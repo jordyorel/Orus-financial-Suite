@@ -58,7 +58,7 @@ pub const BankServer = struct {
     }
 
     // Blocking accept loop — run in a dedicated thread.
-    pub fn serve(self: *const BankServer, alloc: std.mem.Allocator) !void {
+    pub fn serve(self: *BankServer, alloc: std.mem.Allocator) !void {
         const addr = try std.Io.net.IpAddress.parse(self.config.host, self.config.port);
         var server = try addr.listen(self.io, .{ .reuse_address = true });
         defer server.deinit(self.io);
@@ -93,7 +93,7 @@ pub const BankServer = struct {
 
 const ConnCtx = struct {
     stream: std.Io.net.Stream,
-    server: *const BankServer,
+    server: *BankServer,
     alloc: std.mem.Allocator,
 };
 

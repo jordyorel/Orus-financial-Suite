@@ -30,7 +30,7 @@ pub const Gateway = struct {
     // If mac_engine is active, appends MAC (F64) to the outbound message and
     // verifies MAC on the response (returns MacMismatch on failure).
     pub fn process(
-        self:  *const Gateway,
+        self:  *Gateway,
         req:   *const InternalMessage,
         alloc: std.mem.Allocator,
     ) GatewayError!InternalMessage {
@@ -82,7 +82,7 @@ pub const Gateway = struct {
 
     // Send a reversal for an approved payment (0420/0421 → 0430).
     pub fn processReversal(
-        self:     *const Gateway,
+        self:     *Gateway,
         original: *const InternalMessage,
         alloc:    std.mem.Allocator,
     ) GatewayError!InternalMessage {
@@ -95,7 +95,7 @@ pub const Gateway = struct {
     }
 
     // Send sign-on (0800/NMI=301). Stores session key from F96 into mac_engine.
-    pub fn signOn(self: *const Gateway, stan: *u32, alloc: std.mem.Allocator) NetworkError!void {
+    pub fn signOn(self: *Gateway, stan: *u32, alloc: std.mem.Allocator) NetworkError!void {
         var req = network_mgmt.buildRequest(network_mgmt.NMI.SIGNON, stan, alloc)
             catch return error.BankUnreachable;
         defer req.deinit();
@@ -109,7 +109,7 @@ pub const Gateway = struct {
     }
 
     // Send sign-off (0800/NMI=302). Best-effort.
-    pub fn signOff(self: *const Gateway, stan: *u32, alloc: std.mem.Allocator) void {
+    pub fn signOff(self: *Gateway, stan: *u32, alloc: std.mem.Allocator) void {
         var req = network_mgmt.buildRequest(network_mgmt.NMI.SIGNOFF, stan, alloc) catch return;
         defer req.deinit();
         var resp = self.bank.send(&req, alloc) catch return;
@@ -120,7 +120,7 @@ pub const Gateway = struct {
     }
 
     // Send heartbeat (0800/NMI=801). Call every ~30s to keep TCP session alive.
-    pub fn sendHeartbeat(self: *const Gateway, stan: *u32, alloc: std.mem.Allocator) NetworkError!void {
+    pub fn sendHeartbeat(self: *Gateway, stan: *u32, alloc: std.mem.Allocator) NetworkError!void {
         var req = network_mgmt.buildRequest(network_mgmt.NMI.ECHO, stan, alloc)
             catch return error.BankUnreachable;
         defer req.deinit();
@@ -197,7 +197,7 @@ test "Gateway.process: approved 0210 response" {
     const thread = try std.Thread.spawn(.{}, serveBankOnce, .{ &server, io, approval, alloc });
     defer thread.join();
 
-    const gw = Gateway.init(BankClient.init(.{
+    var gw = Gateway.init(BankClient.init(.{
         .host = "127.0.0.1",
         .port = TEST_PORT,
     }, io), 0);
@@ -257,7 +257,7 @@ test "Gateway.process: declined 0210 response" {
     const thread = try std.Thread.spawn(.{}, serveBankOnce, .{ &server, io, decline, alloc });
     defer thread.join();
 
-    const gw = Gateway.init(BankClient.init(.{
+    var gw = Gateway.init(BankClient.init(.{
         .host = "127.0.0.1",
         .port = TEST_PORT + 1,
     }, io), 0);

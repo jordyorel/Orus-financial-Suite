@@ -5,7 +5,7 @@ Infrastructure d'interopérabilité Mobile Money ↔ Banque pour l'Afrique Centr
 | | |
 |---|---|
 | **Version** | 0.1.0 — En développement |
-| **Langage** | Zig 0.14.0 (version pinnée) |
+| **Langage** | Zig 0.16.0 (version pinnée) |
 | **Marché** | Afrique Centrale et Occidentale |
 | **Auteur** | Jordy Hierat |
 

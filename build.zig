@@ -143,7 +143,7 @@ pub fn build(b: *std.Build) void {
     pipeline_step.dependOn(&run_pipeline.step);
 
     const battle_sim_mod = b.addModule("battle-test", .{
-        .root_source_file = b.path("tools/battle_test.zig"),
+        .root_source_file = b.path("tools/battle/main.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
