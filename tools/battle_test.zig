@@ -58,6 +58,9 @@ var g_prev_gw: u64 = 0;
 var g_peak_tps = std.atomic.Value(u64).init(0); // running max over full test duration
 var g_last_tx_ns = std.atomic.Value(i64).init(0); // monotonic ns of last completed transaction
 
+// Live D1 TPS — updated every second by ticker; read by D3 cooperative throttle.
+var g_d1_tps_live = std.atomic.Value(u64).init(0);
+
 // D1 throughput history (MoMo→Bank)
 var g_hist_d1: [60]u64 = [_]u64{0} ** 60;
 var g_prev_d1: u64 = 0;
@@ -344,6 +347,20 @@ fn cashoutWorker() void {
             _ = g_cashout_fail.fetchAdd(1, .monotonic);
         }
 
+        // Cooperative D3 throttle — back off when D1 (MoMo→Bank) is degraded.
+        // Prevents D3 from monopolising CPU/bank workers while D1 recovers.
+        // Extra sleep is proportional to D1 deficit, capped at 4× slot time.
+        const d1_live = g_d1_tps_live.load(.acquire);
+        const peak = g_peak_tps.load(.monotonic);
+        if (peak > 100 and d1_live < peak * 4 / 5) {
+            // deficit_pct ∈ [0, 100]: how far below 80% of peak D1 currently is.
+            const threshold = peak * 4 / 5;
+            const deficit_pct = if (d1_live < threshold) (threshold - d1_live) * 100 / peak else 0;
+            // 1% deficit → 40 µs backoff; 100% deficit → 4 ms backoff.
+            const extra_ns: u64 = deficit_pct * 40_000;
+            _ = std.c.nanosleep(&.{ .sec = 0, .nsec = @intCast(extra_ns) }, null);
+        }
+
         // Rate-limit: sleep the remainder of the slot if the request was faster.
         var ts_now: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.MONOTONIC, &ts_now);
@@ -623,6 +640,8 @@ fn ticker() void {
         const cur_d1 = g_ok.load(.monotonic);
         const tps_d1 = cur_d1 - g_prev_d1;
         g_prev_d1 = cur_d1;
+        // Expose live D1 TPS for cooperative D3 throttle.
+        g_d1_tps_live.store(tps_d1, .release);
         const head1 = g_hist_d1_head.load(.monotonic);
         g_hist_d1[head1] = tps_d1;
         g_hist_d1_head.store((head1 + 1) % 60, .monotonic);
@@ -1159,10 +1178,11 @@ pub fn main() !void {
         if (csock.listen(s, 1024) < 0) return error.ChaosBankListen;
         break :blk s;
     };
-    // 270 bank workers: 256 reserved for gateway keep-alive + 14 slack for
-    // heartbeat, sign-on, D1/D3 startup probes and ad-hoc connections.
-    // At 47 ms latency: 256 / 0.047 ≈ 5 450 tx/s capacity; at 0 ms → ~20 000 tx/s.
-    for (0..270) |_| (try std.Thread.spawn(.{}, runChaosBankWorker, .{bank_sock})).detach();
+    // Bank pool = n_d1 + n_d3 + 14 slack (heartbeat, sign-on, D0–D6 startup probes).
+    // Sized at runtime so the pool always covers the exact worker count detected.
+    const cpu_count_bank: usize = std.Thread.getCpuCount() catch 8;
+    const n_bank: usize = @min(512, cpu_count_bank * 32) + @max(1, cpu_count_bank / 2) + 14;
+    for (0..n_bank) |_| (try std.Thread.spawn(.{}, runChaosBankWorker, .{bank_sock})).detach();
     _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 50_000_000 }, null);
 
     // ── MacEngine + AuditLog ──────────────────────────────────────────────────
@@ -1419,11 +1439,19 @@ pub fn main() !void {
     // ── Ticker ────────────────────────────────────────────────────────────────
     (try std.Thread.spawn(.{}, ticker, .{})).detach();
 
+    // ── Worker sizing — runtime CPU detection (Axe 1) ─────────────────────────
+    // 32 I/O-bound gateway workers per logical CPU gives good parallelism while
+    // avoiding excessive mutex contention.  D3 cashout needs far fewer workers
+    // because it contacts the MoMo server (low latency, no bank round-trip).
+    // Bank pool = D1 + D3 + 14 slack (heartbeat, sign-on, D0-D6 startup probes).
+    const cpu_count: usize = std.Thread.getCpuCount() catch 8;
+    const n_d1: usize = @min(512, cpu_count * 32);
+    const n_d3: usize = @max(1, cpu_count / 2);
+    std.log.info("battle: cpu={d}  D1_workers={d}  D3_workers={d}", .{ cpu_count, n_d1, n_d3 });
+
     // ── Gateway workers (each owns its own BankClient + Io event loop) ───────
-    // 256 workers: halves mutex contention (audit, broker router) and RSS vs 512.
-    // Leaves 14 chaos-bank slots free for heartbeat, sign-on and test probes.
     const gw_args = GwArgs{ .mac_engine = &mac_engine, .audit = &audit, .broker_port = BROKER_PORT };
-    for (0..256) |_| (try std.Thread.spawn(.{}, gatewayWorker, .{gw_args})).detach();
+    for (0..n_d1) |_| (try std.Thread.spawn(.{}, gatewayWorker, .{gw_args})).detach();
 
     // ── Drain consumer (battle.inbound — prevents router deliver queue build-up)
     (try std.Thread.spawn(.{}, drainConsumer, .{})).detach();
@@ -1435,7 +1463,7 @@ pub fn main() !void {
     (try std.Thread.spawn(.{}, d2InjectorWorker, .{})).detach();
 
     // ── Cashout workers (Bank→MoMo direction) ────────────────────────────────
-    for (0..8) |_| (try std.Thread.spawn(.{}, cashoutWorker, .{})).detach();
+    for (0..n_d3) |_| (try std.Thread.spawn(.{}, cashoutWorker, .{})).detach();
 
     // ── HTTP dashboard (blocks until Ctrl+C) ──────────────────────────────────
     httpServer();

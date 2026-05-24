@@ -1,7 +1,8 @@
 // Deduplication filter — ring buffer of the last RING_SIZE processed msg_ids.
 //
 // O(N) scan per check; N=1024 → ~16 KB of state, fast enough for V1.
-// Thread-safe via internal spinlock.
+// Thread-safe via blocking mutex (pthread_mutex_t) — spinlock caused CPU waste
+// at 256 concurrent writers each scanning 1024 entries.
 
 const std       = @import("std");
 const mutex_mod = @import("mutex.zig");
@@ -12,7 +13,7 @@ pub const DedupFilter = struct {
     ring:     [RING_SIZE][16]u8 = std.mem.zeroes([RING_SIZE][16]u8),
     occupied: [RING_SIZE]bool   = [_]bool{false} ** RING_SIZE,
     head:     usize             = 0,
-    mutex:    mutex_mod.SpinMutex = .{},
+    mutex:    mutex_mod.BlockingMutex = .{},
 
     pub fn init() DedupFilter {
         return .{};
