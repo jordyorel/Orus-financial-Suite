@@ -5,6 +5,7 @@ pub const dedup     = @import("dedup.zig");
 pub const topics    = @import("topics.zig");
 pub const transport = @import("transport.zig");
 pub const cursor    = @import("cursor.zig");
+pub const mpsc      = @import("mpsc.zig");
 
 pub const SpinMutex    = mutex.SpinMutex;
 pub const Wal          = wal.Wal;
@@ -14,6 +15,7 @@ pub const Sub          = topics.Sub;
 pub const BrokerServer = transport.BrokerServer;
 pub const Config       = transport.Config;
 pub const Cursor       = cursor.Cursor;
+pub const MpscRing     = mpsc.Ring;
 
 comptime {
     _ = @import("mutex.zig");
@@ -23,4 +25,5 @@ comptime {
     _ = @import("protocol.zig");
     _ = @import("transport.zig");
     _ = @import("cursor.zig");
+    _ = @import("mpsc.zig");
 }

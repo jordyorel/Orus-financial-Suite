@@ -254,13 +254,25 @@ fn handleSubscribe(ctx: *ConnCtx, r: *std.Io.Reader, remaining: u32) void {
         return;
     };
     sub.* = .{
-        .topic  = topic,
-        .stream = ctx.stream,
-        .io     = ctx.server.io,
-        .alive  = true,
+        .topic          = topic,
+        .fd             = ctx.stream.socket.handle,
+        .alive          = true,
+        .ring           = @import("mpsc.zig").Ring.init(),
+        .stopped        = .init(false),
+        .deliver_thread = undefined,
+    };
+
+    // Spawn the deliver thread BEFORE subscribing so it is ready to drain
+    // immediately when the first publish arrives.
+    sub.deliver_thread = std.Thread.spawn(.{}, topics_mod.Sub.deliverLoop, .{sub}) catch {
+        alloc.free(topic);
+        alloc.destroy(sub);
+        return;
     };
 
     ctx.server.router.subscribe(sub) catch {
+        sub.stopped.store(true, .release);
+        sub.deliver_thread.join();
         alloc.free(topic);
         alloc.destroy(sub);
         return;

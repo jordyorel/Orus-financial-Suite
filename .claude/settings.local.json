@@ -104,7 +104,12 @@
       "Bash(kill 59085 58998 58995 58993 68088)",
       "Bash(pkill -f \"battle_test\")",
       "Bash(.zig-cache/o/0495a2c3eb2805526bc62042f5bff40b/battle-test)",
-      "Bash(awk '{print \"PID:\", $2, \"RSS:\", $6/1024, \"MB\"}')"
+      "Bash(awk '{print \"PID:\", $2, \"RSS:\", $6/1024, \"MB\"}')",
+      "Bash(echo \"Build started, PID=$!\")",
+      "Bash(lsof -ti:7782 | xargs kill -9 2>/dev/null; zig build battle > /tmp/battle_output.log 2>&1 & *)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
     ]
   }
 }
