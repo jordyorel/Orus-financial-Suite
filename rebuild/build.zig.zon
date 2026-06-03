@@ -1,0 +1,16 @@
+.{
+    // Le nom de notre projet — utilisé par Zig pour s'y référer
+    .name = .orus_financial_suite,
+
+    // La version sémantique : major.minor.patch
+    .version = "0.1.0",
+
+    // La version minimum de Zig requise pour compiler ce projet
+    .minimum_zig_version = "0.14.0",
+
+    // Les dépendances externes (on n'en a pas pour l'instant)
+    .dependencies = .{},
+
+    // Les fichiers qui font partie du projet (pour la publication)
+    .paths = .{""},
+}
